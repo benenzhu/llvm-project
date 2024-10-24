@@ -104,7 +104,8 @@ static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsStat
 // AddOp
 //===----------------------------------------------------------------------===//
 
-def AddOp : Toy_Op<"add"> {    
+/* 添加 pure */
+def AddOp : Toy_Op<"add", [Pure]> {    
   let summary = "element-wise addition operation";
   let description = [{
     The "add" operation performs element-wise addition between two tensors.
@@ -177,8 +178,9 @@ static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsStat
 
     /// Returns the result types of this function.
     ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
-         
-    Region *getCallableRegion() { return &getBody(); }
+
+    /// Returns the region on the current operation that is callable.
+    ::mlir::Region *getCallableRegion() { return &getBody(); }
   }];
   // 直接加过去了..
          
@@ -252,7 +254,7 @@ def GenericCallOp : Toy_Op<"generic_call"> {
 // MulOp
 //===----------------------------------------------------------------------===//
 
-def MulOp : Toy_Op<"mul"> {    
+def MulOp : Toy_Op<"mul", [Pure]> {    
   let summary = "element-wise multiplication operation";
   let description = [{
     The "mul" operation performs element-wise multiplication between two
@@ -311,7 +313,7 @@ void PrintOp::print(::mlir::OpAsmPrinter &_odsPrinter) {
 // ReshapeOp
 //===----------------------------------------------------------------------===//
 
-def ReshapeOp : Toy_Op<"reshape"> {    
+def ReshapeOp : Toy_Op<"reshape", [Pure]> {    
   let summary = "tensor reshape operation";
   let description = [{
     Reshape operation is transforming its input tensor into a new tensor with
@@ -330,6 +332,9 @@ def ReshapeOp : Toy_Op<"reshape"> {
   let assemblyFormat = [{
     `(` $input `:` type($input) `)` attr-dict `to` type(results)
   }];
+
+  // Enable registering canonicalization patterns with this operation.
+  let hasCanonicalizer = 1;
 }       
 
 //===----------------------------------------------------------------------===//
@@ -358,6 +363,8 @@ def ReturnOp : Toy_Op<"return", [Pure, HasParent<"FuncOp">,
   let arguments = (ins Variadic<F64Tensor>:$input);
 
   // The return operation only emits the input in the format if it is present.
+  /* 这个是新加的吧还是上次忘了呢？ 。。。。*/
+  let assemblyFormat = "($input^ `:` type($input))? attr-dict ";
   
   // Allow building a ReturnOp with no return operand.
 /*
@@ -374,7 +381,7 @@ def ReturnOp : Toy_Op<"return", [Pure, HasParent<"FuncOp">,
     bool hasOperand() { return getNumOperands() != 0; }
   }];
 
-  // Invoke a static verify method to verify this return operation.
+  // Indicate that additional verification for this operation is necessary.
   let hasVerifier = 1;
 }
 
@@ -382,7 +389,7 @@ def ReturnOp : Toy_Op<"return", [Pure, HasParent<"FuncOp">,
 // TransposeOp
 //===----------------------------------------------------------------------===//
 
-def TransposeOp : Toy_Op<"transpose"> {    
+def TransposeOp : Toy_Op<"transpose", [Pure]> {    
   let summary = "transpose operation";
       
   let arguments = (ins F64Tensor:$input);
@@ -392,12 +399,17 @@ def TransposeOp : Toy_Op<"transpose"> {
     `(` $input `:` type($input) `)` attr-dict `to` type(results)
   }];
 
+  // Enable registering canonicalization patterns with this operation.
+  // 这里是 enable 的关键吧
+  let hasCanonicalizer = 1;
+
   // Allow building a TransposeOp with from the input operand.
   let builders = [
     OpBuilder<(ins "Value":$input)>
   ];
 
   // Invoke a static verify method to verify this transpose operation.
+  // Indicate that additional verification for this operation is necessary.
   /*
 ::llvm::LogicalResult TransposeOp::verifyInvariants() {
   if(::mlir::succeeded(verifyInvariantsImpl()) && ::mlir::succeeded(verify()))
