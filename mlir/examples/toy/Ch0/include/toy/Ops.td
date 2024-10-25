@@ -13,10 +13,12 @@
 #ifndef TOY_OPS
 #define TOY_OPS
 
-include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/CastInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "toy/ShapeInferenceInterface.td"
  
 // Provide a definition of the 'toy' dialect in the ODS framework so that we
 // can define our operations.
@@ -127,6 +129,31 @@ def AddOp : Toy_Op<"add", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// CastOp
+//===----------------------------------------------------------------------===//
+
+  // DeclareOpInterfaceMethods<ShapeInferenceOpInterface>,
+def CastOp : Toy_Op<"cast", [
+    DeclareOpInterfaceMethods<CastOpInterface>,
+    Pure,
+    SameOperandsAndResultShape
+   ]> {
+   let summary = "shape cast operation";
+   let description = [{
+    The "cast" operation converts a tensor from one type to an equivalent type
+    without changing any data elements. The source and destination types must
+    both be tensor types with the same element type. If both are ranked, then
+    shape is required to match. The operation is invalid if converting to a
+    mismatching constant dimension.
+   }];
+   
+   let arguments = (ins F64Tensor:$input);
+   let results = (outs F64Tensor:$output);  
+   
+   let assemblyFormat = "$input attr-dict `:` type($input) `to` type($output)";
+ }
+
+//===----------------------------------------------------------------------===//
 // FuncOp
 //===----------------------------------------------------------------------===//
 
@@ -180,7 +207,7 @@ static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsStat
     ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
 
     /// Returns the region on the current operation that is callable.
-    ::mlir::Region *getCallableRegion() { return &getBody(); }
+    Region *getCallableRegion() { return &getBody(); }
   }];
   // 直接加过去了..
          
@@ -193,7 +220,17 @@ static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsStat
 // GenericCallOp
 //===----------------------------------------------------------------------===//
 
-def GenericCallOp : Toy_Op<"generic_call"> {    
+/*class GenericCallOp : public ::mlir::Op<GenericCallOp, ::mlir::OpTrait::ZeroRegions, ::mlir::OpTrait::OneResult, ::mlir::OpTrait::OneTypedResult<::mlir::TensorType>::Impl, ::mlir::OpTrait::ZeroSuccessors, ::mlir::OpTrait::VariadicOperands, ::mlir::OpTrait::OpInvariants, ::mlir::BytecodeOpInterface::Trait, ::mlir::CallOpInterface::Trait> {*/
+/* 多了 callOpInterface 的声明 */
+/*
+ 多了三个函数
+  ::mlir::CallInterfaceCallable getCallableForCallee();
+  void setCalleeFromCallable(::mlir::CallInterfaceCallable callee);
+  ::mlir::Operation::operand_range getArgOperands();
+  ::mlir::MutableOperandRange getArgOperandsMutable();
+*/
+def GenericCallOp : Toy_Op<"generic_call",
+    [DeclareOpInterfaceMethods<CallOpInterface>]> {    
     let summary = "generic call operation";
     let description = [{
       Generic calls represent calls to a user defined function that needs to

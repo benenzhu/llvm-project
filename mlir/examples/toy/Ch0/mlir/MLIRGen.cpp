@@ -11,15 +11,31 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "toy/MLIRGen.h" 
-#include "mlir/IR/BuiltinOps.h"
+#include "toy/MLIRGen.h"
+#include "mlir/IR/Block.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Value.h"
-#include "mlir/IR/Verifier.h"
-#include "toy/AST.h" 
-#include "llvm/ADT/StringRef.h"
+#include "toy/AST.h"
 #include "toy/Dialect.h"
+
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Verifier.h"
+#include "toy/Lexer.h"
+
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopedHashTable.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
+#include <cassert>
+#include <cstdint>
+#include <functional>
 #include <numeric>
+#include <optional>
+#include <vector>
  
 using namespace mlir::toy; 
 using namespace toy;
@@ -159,6 +175,11 @@ private:
       function.setType(builder.getFunctionType(
           function.getFunctionType().getInputs(), getType(VarType{})));
     }
+
+    // If this function isn't main, then set the visibility to private.
+    if (funcAST.getProto()->getName() != "main")
+      /* 在出来的里面加上了 private, mlir 里面,同时让 symbol 变成private 的*/
+      function.setPrivate();
 
     return function;
   } 

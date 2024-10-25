@@ -125,6 +125,8 @@ int dumpMLIR() {
         if (mlir::failed(mlir::applyPassManagerCLOptions(pm)))
             return 4;
 
+        // Inline all functions into main and then delete them.
+        pm.addPass(mlir::createInlinerPass());
         /* 添加 opt 的 passes */
         // Add a run of the canonicalizer to optimize the mlir module.
         /* 为什么这里是加到 FuncOp 上？ */
