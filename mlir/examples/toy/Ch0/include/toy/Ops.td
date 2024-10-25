@@ -107,7 +107,8 @@ static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsStat
 //===----------------------------------------------------------------------===//
 
 /* 添加 pure */
-def AddOp : Toy_Op<"add", [Pure]> {    
+def AddOp : Toy_Op<"add",
+    [Pure, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>]> {    
   let summary = "element-wise addition operation";
   let description = [{
     The "add" operation performs element-wise addition between two tensors.
@@ -135,6 +136,7 @@ def AddOp : Toy_Op<"add", [Pure]> {
   // DeclareOpInterfaceMethods<ShapeInferenceOpInterface>,
 def CastOp : Toy_Op<"cast", [
     DeclareOpInterfaceMethods<CastOpInterface>,
+    DeclareOpInterfaceMethods<ShapeInferenceOpInterface>,
     Pure,
     SameOperandsAndResultShape
    ]> {
@@ -429,7 +431,8 @@ def ReturnOp : Toy_Op<"return", [Pure, HasParent<"FuncOp">,
 // TransposeOp
 //===----------------------------------------------------------------------===//
 
-def TransposeOp : Toy_Op<"transpose", [Pure]> {    
+def TransposeOp : Toy_Op<"transpose",
+    [Pure, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>]> {    
   let summary = "transpose operation";
       
   let arguments = (ins F64Tensor:$input);
