@@ -291,7 +291,10 @@ def GenericCallOp : Toy_Op<"generic_call",
 // MulOp
 //===----------------------------------------------------------------------===//
 
-def MulOp : Toy_Op<"mul", [Pure]> {    
+/*class MulOp : public ::mlir::Op<MulOp, ::mlir::OpTrait::ZeroRegions, ::mlir::OpTrait::OneResult, ::mlir::OpTrait::OneTypedResult<::mlir::TensorType>::Impl, ::mlir::OpTrait::ZeroSuccessors, ::mlir::OpTrait::NOperands<2>::Impl, ::mlir::OpTrait::OpInvariants, ::mlir::ConditionallySpeculatable::Trait, ::mlir::OpTrait::AlwaysSpeculatableImplTrait, ::mlir::MemoryEffectOpInterface::Trait, ShapeInference::Trait> {*/
+// 加了 shapeInference的trait 来进行验证
+def MulOp : Toy_Op<"mul",
+    [Pure, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>]> {    
   let summary = "element-wise multiplication operation";
   let description = [{
     The "mul" operation performs element-wise multiplication between two

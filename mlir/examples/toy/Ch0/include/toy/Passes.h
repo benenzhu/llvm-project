@@ -10,17 +10,18 @@
 //
 //===----------------------------------------------------------------------===//
 
- 
- 
+#ifndef TOY_PASSES_H
+#define TOY_PASSES_H
 
- 
+#include <memory>
 
-  
- 
+namespace mlir {
+class Pass;
 
-  
- 
- // namespace toy
- // namespace mlir
+namespace toy {
+    /*shape inference pass必须实现在这里, 否则无法在toy中使用*/
+std::unique_ptr<Pass> createShapeInferencePass();
+} // namespace toy
+} // namespace mlir
 
- // TOY_PASSES_H
+#endif // TOY_PASSES_H

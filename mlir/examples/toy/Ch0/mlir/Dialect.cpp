@@ -95,6 +95,7 @@ UNREACHABLE executed at /A/__code/llvm-project/mlir/include/mlir/Transforms/Inli
   Operation *materializeCallConversion(OpBuilder &builder, Value input,
                                         Type resultType,
                                         Location conversionLoc) const final {
+    /* 所以是这里转换的 cast op, 之后看看怎么转换的,怎么替换的图*/
     return builder.create<CastOp>(conversionLoc, resultType, input);
   }
 };
@@ -377,6 +378,11 @@ mlir::ParseResult MulOp::parse(mlir::OpAsmParser &parser,
 }
    
 void MulOp::print(mlir::OpAsmPrinter &p) { printBinaryOp(p, *this); }
+
+/// Infer the output shape of the MulOp, this is required by the shape inference
+/// interface.
+/// /* 这里的 shape 是和 input 的 shape 一致的 , 但是只取了 getLhs 的 shape*/
+void MulOp::inferShapes() { getResult().setType(getLhs().getType()); }
 
 //===----------------------------------------------------------------------===//
 // ReturnOp

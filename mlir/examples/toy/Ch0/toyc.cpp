@@ -10,18 +10,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/IR/AsmState.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/OwningOpRef.h"
-#include "mlir/Parser/Parser.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/Passes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "toy/AST.h"
 #include "toy/Dialect.h"
 #include "toy/Lexer.h"
 #include "toy/MLIRGen.h"
 #include "toy/Parser.h"
+#include "toy/Passes.h"
+
+#include "mlir/IR/AsmState.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
@@ -32,6 +35,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 
 using namespace toy; 
 namespace cl = llvm::cl;
@@ -130,7 +134,15 @@ int dumpMLIR() {
         /* 添加 opt 的 passes */
         // Add a run of the canonicalizer to optimize the mlir module.
         /* 为什么这里是加到 FuncOp 上？ */
-        pm.addNestedPass<mlir::toy::FuncOp>(mlir::createCanonicalizerPass());
+        
+        // Now that there is only one function, we can infer the shapes of each of
+        // the operations.
+        // /* 这里做了些特化,因为全部 inline 进来了*/
+        mlir::OpPassManager &optPM = pm.nest<mlir::toy::FuncOp>();
+        optPM.addPass(mlir::toy::createShapeInferencePass());
+        optPM.addPass(mlir::createCanonicalizerPass());
+        // optPM.addPass(mlir::createCSEPass());
+        
         if (mlir::failed(pm.run(*module)))
             return 4;
     }
