@@ -15,6 +15,7 @@ add_toy_chapter(toyc-ch0
   parser/AST.cpp
   mlir/MLIRGen.cpp
   mlir/Dialect.cpp
+  mlir/LowerToAffineLoops.cpp
   mlir/ShapeInferencePass.cpp
   mlir/ToyCombine.cpp
 
@@ -27,8 +28,13 @@ add_toy_chapter(toyc-ch0
 # this line is new here
 include_directories(${CMAKE_CURRENT_BINARY_DIR}) 
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include/)
+# 这两个是做什么的? 
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
 target_link_libraries(toyc-ch0
   PRIVATE
+   ${dialect_libs}
+   ${extension_libs}
     MLIRAnalysis
     MLIRCastInterfaces
     MLIRCallInterfaces

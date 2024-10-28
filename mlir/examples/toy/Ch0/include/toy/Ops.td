@@ -208,7 +208,7 @@ static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsStat
     /// Returns the result types of this function.
     ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
 
-    /// Returns the region on the current operation that is callable.
+    /// Returns the region on the function operation that is callable.
     Region *getCallableRegion() { return &getBody(); }
   }];
   // 直接加过去了..
@@ -330,7 +330,10 @@ def PrintOp : Toy_Op<"print"> {
   }];
 
   // The print operation takes an input tensor to print.
-  let arguments = (ins F64Tensor:$input);
+  /* 
+  这里的递降是多了一个参数出来 ... */
+  // We also allow a F64MemRef to enable interop during partial lowering.
+  let arguments = (ins AnyTypeOf<[F64Tensor, F64MemRef]>:$input);
 
 /*
 void PrintOp::print(::mlir::OpAsmPrinter &_odsPrinter) {

@@ -21,6 +21,10 @@ class Pass;
 namespace toy {
     /*shape inference pass必须实现在这里, 否则无法在toy中使用*/
 std::unique_ptr<Pass> createShapeInferencePass();
+/// Create a pass for lowering to operations in the `Affine` and `Std` dialects,
+/// for a subset of the Toy IR (e.g. matmul).
+std::unique_ptr<mlir::Pass> createLowerToAffinePass();
+
 } // namespace toy
 } // namespace mlir
 
