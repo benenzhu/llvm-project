@@ -31,6 +31,11 @@
 - 在模板内部点击变量定义（如 `now`）不会清除上下文
 - 只有跳出模板文件才会清除上下文
 
+### 6. 链式模板跳转过滤（新增）
+当在模板函数体内跳转到另一个模板函数时，自动过滤重载：
+- 从 `G::load` 跳转后，在其内部再跳转 `kittens::load`，只返回正确的实例化版本
+- 使用 `CallFinder` 在实例化函数体中查找实际被调用的函数
+
 ## 修改的文件
 
 ### clang-tools-extra/clangd/XRefs.h
@@ -42,11 +47,15 @@
 ### clang-tools-extra/clangd/XRefs.cpp
 - `locateASTReferent`: 添加模板实例化上下文记录逻辑
 - `locateASTReferent`: 添加基于上下文的重载过滤（使用 `CallFinder` 在实例化函数中查找实际被调用的函数）
+- `findInstantiatedFunctionForJump`: 增强搜索逻辑，支持类模板特化中的成员函数
 - 修复位置匹配逻辑：检查目标位置是否在 `CallExpr` 的 callee 范围内
+- 过滤时同时匹配 `CalleeID` 和 `PatternID`
 
 ### clang-tools-extra/clangd/ClangdServer.h
 - 添加 `ActiveTemplateContext` 成员变量
+- 添加 `TemplateContextHistory` 历史栈
 - 添加 `setTemplateContext`, `getTemplateContext`, `clearTemplateContext` 方法
+- 添加 `pushTemplateContextToHistory`, `popTemplateContextFromHistory` 方法
 
 ### clang-tools-extra/clangd/ClangdServer.cpp
 - `locateSymbolAt`: 传递和更新模板上下文
@@ -58,21 +67,79 @@
 
 ### clang-tools-extra/clangd/Hover.cpp
 - `printDependentVarValue`: 使用 `TemplateCtx` 过滤实例化，只显示对应实例化的值
+- `printDependentClassMemberValue`: 处理类模板静态成员的 hover
 - `pickDeclToUse`: 使用 `TemplateCtx` 过滤重载声明
 - `getHoverContents`: 传递 `TemplateCtx`
 
-## 测试
+## 测试文件
 
-### 测试文件
-测试文件位于 `/A/clangd-dev/jumptest/` 目录：
+### jumptest/ 目录 - 简单测试用例
 
-- `jump2.cpp` - 主测试文件，包含模板和重载函数
-- `test_both_types.py` - 测试 float 和 double 两种实例化
-- `test_user_flow.py` - 模拟用户实际操作流程
-- `test_single_file.py` - 单文件模板测试
-- `test_debug_log.py` - 带调试日志的测试
+#### 源文件
+| 文件 | 说明 |
+|------|------|
+| `jump.cpp` | 原始测试文件 |
+| `jump2.cpp` | **主测试文件**，包含模板函数 `mma_AB` 和重载函数 `mma_AB_base` |
+| `jump3.cpp` | 嵌套模板测试，包含二次跳转场景和类模板 |
 
-### 运行测试
+#### Python 测试脚本
+| 文件 | 说明 | 运行命令 |
+|------|------|----------|
+| `test_both_types.py` | 测试 float 和 double 两种实例化 | `python3 test_both_types.py` |
+| `test_jump3.py` | 测试 jump3.cpp 的嵌套模板场景 | `python3 test_jump3.py` |
+| `test_user_flow.py` | 模拟用户实际操作流程 | `python3 test_user_flow.py` |
+| `test_single_file.py` | 单文件模板测试 | `python3 test_single_file.py` |
+| `test_rows_hover.py` | 测试 `rows` hover 功能 | `python3 test_rows_hover.py` |
+| `test_simple.py` | 简单测试 | `python3 test_simple.py` |
+| `test_debug_log.py` | 带调试日志的测试 | `python3 test_debug_log.py` |
+| `test_debug.py` | 调试测试 | `python3 test_debug.py` |
+| `test_clangd.py` | clangd 基础测试 | `python3 test_clangd.py` |
+| `test_real_workflow.py` | 真实工作流测试 | `python3 test_real_workflow.py` |
+
+### hip-test/ 目录 - 大型项目测试
+
+#### 源文件
+| 文件 | 说明 |
+|------|------|
+| `read.cpp` | **大型 HIP/CUDA 测试文件**（~9000行），包含复杂的模板嵌套和类模板成员函数 |
+
+#### Python 测试脚本
+| 文件 | 说明 | 运行命令 |
+|------|------|----------|
+| `test_load_chain_debug.py` | **主要测试**: 链式跳转过滤测试 | `python3 test_load_chain_debug.py` |
+| `test_template_context.py` | 模板上下文测试 | `python3 test_template_context.py` |
+| `test_load_jump.py` | load 跳转测试 | `python3 test_load_jump.py` |
+| `test_load_chain.py` | 链式跳转测试 | `python3 test_load_chain.py` |
+| `test_load_chain_v2.py` | 链式跳转测试 v2 | `python3 test_load_chain_v2.py` |
+| `test_load_v2.py` | load 测试 v2 | `python3 test_load_v2.py` |
+| `test_load_simple.py` | 简单 load 测试 | `python3 test_load_simple.py` |
+| `test_debug.py` | 调试测试 | `python3 test_debug.py` |
+| `test_debug2.py` | 调试测试 2 | `python3 test_debug2.py` |
+
+## 关键测试场景
+
+### 场景 1: jump2.cpp - 基础模板过滤
+```
+mma_AB(a)  →  mma_AB 定义  →  hover now 显示 Value=4/8
+                           →  jump mma_AB_base 只跳到正确重载
+```
+
+### 场景 2: jump3.cpp - 嵌套模板和二次跳转
+```
+mma_ABt(C_accum[0], tiles[1])  →  mma_ABt 定义 (line 36)
+                                →  hover D::rows 显示实例化类型
+                                →  jump D::rows → _rows (line 50)
+                                →  hover _rows 显示实例化值 64
+```
+
+### 场景 3: read.cpp - 链式模板跳转（✅ 已修复）
+```
+G::load(As, g.a, ...) (line 9064)  →  kittens::load 定义 (line 7813)
+                                    →  jump kittens::load<...> (line 7814)
+                                    →  只返回 1 个结果（之前返回 9 个）
+```
+
+## 运行测试
 
 ```bash
 # 编译 clangd (Release 版本)
@@ -80,18 +147,21 @@ cd /A/clangd-dev/build
 cmake -DCMAKE_BUILD_TYPE=Release .
 mold -run ninja clangd
 
-# 运行 Python 测试
+# 运行简单测试
 cd /A/clangd-dev/jumptest
-python3 test_both_types.py    # 测试两种类型的实例化
-python3 test_user_flow.py     # 测试用户操作流程
+python3 test_both_types.py
+python3 test_jump3.py
+
+# 运行大型项目测试（推荐）
+cd /A/clangd-dev/hip-test
+python3 test_load_chain_debug.py    # 链式跳转过滤测试
 
 # 运行单元测试
 cd /A/clangd-dev/build
 ./tools/clang/tools/extra/clangd/unittests/ClangdTests --gtest_filter="*Hover*"
-./tools/clang/tools/extra/clangd/unittests/ClangdTests --gtest_filter="*DependentVarValue*"
 ```
 
-### 测试用例 (jump2.cpp)
+## 测试用例 (jump2.cpp)
 
 ```cpp
 void mma_AB_base(int* a){ }
@@ -142,20 +212,54 @@ Release 版本的 clangd 位于：
 ## 技术细节
 
 ### CallFinder 类
-用于在实例化函数的 AST 中查找特定位置的函数调用，关键是检查目标位置是否在 `CallExpr` 的 callee 表达式范围内：
+用于在实例化函数的 AST 中查找特定位置的函数调用：
 
 ```cpp
 bool VisitCallExpr(CallExpr *CE) {
     Expr *CalleeExpr = CE->getCallee();
     unsigned BeginOffset = SM.getFileOffset(SM.getSpellingLoc(CalleeExpr->getBeginLoc()));
-    // 检查目标位置是否在 callee 范围内（+20 容差）
-    if (TargetOffset >= BeginOffset && TargetOffset <= BeginOffset + 20) {
+    // 检查目标位置是否在 callee 范围内（+50 容差）
+    if (TargetOffset >= BeginOffset && TargetOffset <= BeginOffset + 50) {
         if (const auto *Callee = CE->getDirectCallee()) {
             FoundCallee = Callee;
             return false;
         }
     }
     return true;
+}
+```
+
+### 过滤逻辑（链式跳转）
+```cpp
+// 1. 使用 ActiveTemplateCtx 找到外层函数的实例化
+InstFD = findInstantiatedFunctionForJump(AST.getASTContext(), ActiveTemplateCtx);
+
+// 2. 在实例化函数体中查找目标调用
+CallFinder Finder(CurLoc, SM);
+Finder.TraverseDecl(const_cast<FunctionDecl *>(InstFD));
+
+// 3. 同时匹配 CalleeID 和 PatternID
+SymbolID PatternID = CalleeID;
+if (const FunctionDecl *Pattern = Callee->getTemplateInstantiationPattern())
+  PatternID = getSymbolID(Pattern);
+
+for (auto &R : Result) {
+  if (R.ID == CalleeID || R.ID == PatternID) {
+    FilteredResult.push_back(std::move(R));
+    break;
+  }
+}
+```
+
+### findInstantiatedFunctionForJump 搜索逻辑
+支持在类模板特化中搜索成员函数：
+```cpp
+// 递归搜索 ClassTemplateDecl 的 specializations
+if (const auto *CTD = dyn_cast<ClassTemplateDecl>(D)) {
+  for (ClassTemplateSpecializationDecl *Spec : CTD->specializations()) {
+    if (auto *Found = SearchInContext(Spec))
+      return Found;
+  }
 }
 ```
 
@@ -171,8 +275,8 @@ bool keepContext = (TargetFile == CurrentCtx->TemplateFile ||
 ## 已知限制
 
 1. **跨文件上下文**：当模板定义在头文件中时，需要使用原始 .cpp 文件的 AST（尚未完全实现）
-2. **多重嵌套模板**：目前只支持单层模板实例化上下文
-3. **类模板成员函数**：目前主要测试了函数模板
+2. **多重嵌套模板**：支持二级嵌套，更深层次可能需要额外处理
+3. **类模板成员函数**：主要测试了函数模板和类模板成员
 
 ## 相关文件结构
 
@@ -187,8 +291,14 @@ bool keepContext = (TargetFile == CurrentCtx->TemplateFile ||
 │   └── ClangdServer.cpp # 服务器实现
 ├── build/
 │   └── bin/clangd       # 编译输出
-└── jumptest/
-    ├── jump2.cpp        # 测试文件
+├── jumptest/            # 简单测试用例
+│   ├── jump.cpp
+│   ├── jump2.cpp        # 主测试文件
+│   ├── jump3.cpp        # 嵌套模板测试
+│   ├── compile_commands.json
+│   └── test_*.py        # Python 测试脚本
+└── hip-test/            # 大型项目测试
+    ├── read.cpp         # 大型 HIP/CUDA 测试文件
+    ├── compile_commands.json
     └── test_*.py        # Python 测试脚本
 ```
-
