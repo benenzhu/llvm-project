@@ -836,7 +836,22 @@ void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
                           TargetFile == CurrentFile);
       
       if (!keepContext) {
-        const_cast<ClangdServer *>(this)->clearTemplateContext();
+        // Before clearing, try to find a suitable context from history
+        // that matches the target file
+        auto *Server = const_cast<ClangdServer *>(this);
+        std::lock_guard<std::mutex> Lock(Server->TemplateContextMutex);
+        bool foundInHistory = false;
+        for (auto it = Server->TemplateContextHistory.rbegin();
+             it != Server->TemplateContextHistory.rend(); ++it) {
+          if (it->TemplateFile == TargetFile || it->OriginFile == TargetFile) {
+            Server->ActiveTemplateContext = *it;
+            foundInHistory = true;
+            break;
+          }
+        }
+        if (!foundInHistory) {
+          Server->ActiveTemplateContext = std::nullopt;
+        }
       }
     }
     CB(std::move(Results));
@@ -880,16 +895,27 @@ void ClangdServer::findDocumentHighlights(
 void ClangdServer::findHover(PathRef File, Position Pos,
                              Callback<std::optional<HoverInfo>> CB) {
   auto TemplateCtx = getTemplateContext();
+  // Also get a context from history in case the main one doesn't apply
+  auto HistoryCtx = getTemplateContextFromHistory(File);
 
   auto Action = [File = File.str(), Pos, CB = std::move(CB), TemplateCtx,
-                 this](llvm::Expected<InputsAndAST> InpAST) mutable {
+                 HistoryCtx, this](llvm::Expected<InputsAndAST> InpAST) mutable {
     if (!InpAST)
       return CB(InpAST.takeError());
 
     format::FormatStyle Style = getFormatStyleForFile(
         File, InpAST->Inputs.Contents, *InpAST->Inputs.TFS, false);
-    CB(clangd::getHover(InpAST->AST, Pos, std::move(Style), Index,
-                        std::move(TemplateCtx)));
+    
+    // First try with the active template context
+    auto Result = clangd::getHover(InpAST->AST, Pos, Style, Index, TemplateCtx);
+    
+    // If no result and we have a history context, try that
+    if (!Result && HistoryCtx) {
+      Result = clangd::getHover(InpAST->AST, Pos, std::move(Style), Index,
+                                std::move(HistoryCtx));
+    }
+    
+    CB(std::move(Result));
   };
 
   WorkScheduler->runWithAST("Hover", File, std::move(Action), Transient);
@@ -1231,13 +1257,49 @@ void ClangdServer::profile(MemoryTree &MT) const {
 void ClangdServer::setTemplateContext(
     std::optional<TemplateInstantiationContext> Ctx) {
   std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  // Push the old context to history before replacing
+  if (ActiveTemplateContext && Ctx) {
+    // Don't push duplicate contexts
+    bool isDuplicate = false;
+    if (!TemplateContextHistory.empty()) {
+      const auto &Last = TemplateContextHistory.back();
+      isDuplicate = (Last.InstantiationID == ActiveTemplateContext->InstantiationID);
+    }
+    if (!isDuplicate) {
+      TemplateContextHistory.push_back(*ActiveTemplateContext);
+      if (TemplateContextHistory.size() > MaxTemplateContextHistory)
+        TemplateContextHistory.erase(TemplateContextHistory.begin());
+    }
+  }
   ActiveTemplateContext = std::move(Ctx);
+}
+
+void ClangdServer::pushTemplateContextToHistory() {
+  std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  if (ActiveTemplateContext) {
+    TemplateContextHistory.push_back(*ActiveTemplateContext);
+    if (TemplateContextHistory.size() > MaxTemplateContextHistory)
+      TemplateContextHistory.erase(TemplateContextHistory.begin());
+  }
 }
 
 std::optional<TemplateInstantiationContext>
 ClangdServer::getTemplateContext() const {
   std::lock_guard<std::mutex> Lock(TemplateContextMutex);
   return ActiveTemplateContext;
+}
+
+std::optional<TemplateInstantiationContext>
+ClangdServer::getTemplateContextFromHistory(llvm::StringRef File) const {
+  std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  // Search history from most recent to oldest
+  for (auto it = TemplateContextHistory.rbegin();
+       it != TemplateContextHistory.rend(); ++it) {
+    if (it->TemplateFile == File || it->OriginFile == File) {
+      return *it;
+    }
+  }
+  return std::nullopt;
 }
 
 void ClangdServer::clearTemplateContext() {

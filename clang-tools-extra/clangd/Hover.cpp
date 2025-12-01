@@ -9,6 +9,7 @@
 #include "Hover.h"
 
 #include "AST.h"
+#include "support/Logger.h"
 #include "CodeCompletionStrings.h"
 #include "Config.h"
 #include "FindTarget.h"
@@ -676,6 +677,276 @@ std::optional<std::string> printDependentVarValue(
   return Result;
 }
 
+/// Print the value of a static member variable in a class template, using
+/// template context to find the specific instantiation.
+std::optional<std::string> printDependentClassMemberValue(
+    const VarDecl *VD, const ASTContext &Ctx,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+  if (!VD || !VD->isStaticDataMember())
+    return std::nullopt;
+  
+  // Check if the initializer is value-dependent
+  const Expr *Init = VD->getInit();
+  if (!Init || !Init->isValueDependent())
+    return std::nullopt;
+
+  // Find the enclosing class template
+  const DeclContext *DC = VD->getDeclContext();
+  const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC);
+  if (!RD)
+    return std::nullopt;
+
+  // Get the class template if this is a template pattern
+  const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+  if (!CTD) {
+    // Maybe it's already a specialization
+    if (const auto *Spec = dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
+      CTD = Spec->getSpecializedTemplate();
+    }
+  }
+  if (!CTD)
+    return std::nullopt;
+
+  StringRef VarName = VD->getName();
+  
+  // If we have template context, try to find the matching instantiation
+  if (TemplateCtx && !TemplateCtx->TemplateArgs.empty()) {
+    // First try to compute directly from template args (e.g. sizeof(T))
+    if (auto Val = computeValueFromTemplateArg(Init, TemplateCtx->TemplateArgs[0], Ctx)) {
+      return *Val;
+    }
+    
+    // Try to find matching class specialization
+    for (ClassTemplateSpecializationDecl *Spec : CTD->specializations()) {
+      // Check if template args match
+      const TemplateArgumentList &Args = Spec->getTemplateArgs();
+      if (Args.size() > 0) {
+        PrintingPolicy PP(Ctx.getLangOpts());
+        std::string SpecArgStr;
+        llvm::raw_string_ostream OS(SpecArgStr);
+        Args.get(0).print(PP, OS, /*IncludeType=*/false);
+        
+        if (SpecArgStr == TemplateCtx->TemplateArgs[0]) {
+          // Found matching specialization, look for the variable
+          for (const Decl *D : Spec->decls()) {
+            if (const auto *SpecVar = dyn_cast<VarDecl>(D)) {
+              if (SpecVar->getName() == VarName) {
+                if (const Expr *SpecInit = SpecVar->getInit()) {
+                  if (!SpecInit->isValueDependent()) {
+                    return printExprValue(SpecInit, Ctx);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback: collect values from all instantiations
+  llvm::SmallVector<std::string, 4> Values;
+  for (ClassTemplateSpecializationDecl *Spec : CTD->specializations()) {
+    for (const Decl *D : Spec->decls()) {
+      if (const auto *SpecVar = dyn_cast<VarDecl>(D)) {
+        if (SpecVar->getName() == VarName) {
+          if (const Expr *SpecInit = SpecVar->getInit()) {
+            if (!SpecInit->isValueDependent()) {
+              if (auto Val = printExprValue(SpecInit, Ctx)) {
+                Values.push_back(*Val);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (Values.empty())
+    return std::nullopt;
+
+  llvm::sort(Values);
+  Values.erase(llvm::unique(Values), Values.end());
+
+  if (Values.size() == 1)
+    return Values[0];
+
+  std::string Result;
+  llvm::raw_string_ostream OS(Result);
+  OS << Values[0];
+  for (size_t I = 1; I < Values.size() && I < 3; ++I)
+    OS << ", " << Values[I];
+  if (Values.size() > 3)
+    OS << ", ...";
+  OS << " (from instantiations)";
+  return Result;
+}
+
+/// Helper to recursively search for function template specializations
+static const FunctionDecl *findInstantiatedFunctionInContext(
+    const DeclContext *DC, const SymbolID &TargetID) {
+  for (const Decl *D : DC->decls()) {
+    // Check function templates
+    if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D)) {
+      for (FunctionDecl *Spec : FTD->specializations()) {
+        if (getSymbolID(Spec) == TargetID)
+          return Spec;
+      }
+    }
+    // Recurse into namespaces
+    if (const auto *ND = dyn_cast<NamespaceDecl>(D)) {
+      if (const FunctionDecl *Found =
+              findInstantiatedFunctionInContext(ND, TargetID))
+        return Found;
+    }
+    // Recurse into classes/structs
+    if (const auto *RD = dyn_cast<CXXRecordDecl>(D)) {
+      if (const FunctionDecl *Found =
+              findInstantiatedFunctionInContext(RD, TargetID))
+        return Found;
+    }
+    // Also check class template specializations
+    if (const auto *CTSD = dyn_cast<ClassTemplateSpecializationDecl>(D)) {
+      if (const FunctionDecl *Found =
+              findInstantiatedFunctionInContext(CTSD, TargetID))
+        return Found;
+    }
+    // Check linkage spec (extern "C" blocks)
+    if (const auto *LS = dyn_cast<LinkageSpecDecl>(D)) {
+      if (const FunctionDecl *Found =
+              findInstantiatedFunctionInContext(LS, TargetID))
+        return Found;
+    }
+  }
+  return nullptr;
+}
+
+/// Find a FunctionDecl instantiation that matches the template context.
+const FunctionDecl *findInstantiatedFunction(
+    const ASTContext &Ctx,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+  if (!TemplateCtx || !TemplateCtx->InstantiationID)
+    return nullptr;
+
+  return findInstantiatedFunctionInContext(Ctx.getTranslationUnitDecl(),
+                                           *TemplateCtx->InstantiationID);
+}
+
+/// AST visitor to find a MemberExpr at a specific source location in an
+/// instantiated function body.
+class InstantiatedMemberFinder
+    : public RecursiveASTVisitor<InstantiatedMemberFinder> {
+public:
+  InstantiatedMemberFinder(const SourceManager &SM, unsigned TargetOffset)
+      : SM(SM), TargetOffset(TargetOffset) {}
+
+  bool VisitMemberExpr(MemberExpr *ME) {
+    unsigned MemberOffset =
+        SM.getFileOffset(SM.getSpellingLoc(ME->getMemberLoc()));
+    // Check if the target position is within the member name
+    if (TargetOffset >= MemberOffset && TargetOffset <= MemberOffset + 20) {
+      FoundMember = ME;
+      return false; // Stop traversal
+    }
+    return true;
+  }
+
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    unsigned DeclOffset =
+        SM.getFileOffset(SM.getSpellingLoc(DRE->getLocation()));
+    if (TargetOffset >= DeclOffset && TargetOffset <= DeclOffset + 20) {
+      FoundDeclRef = DRE;
+      return false;
+    }
+    return true;
+  }
+
+  MemberExpr *getFoundMember() const { return FoundMember; }
+  DeclRefExpr *getFoundDeclRef() const { return FoundDeclRef; }
+
+private:
+  const SourceManager &SM;
+  unsigned TargetOffset;
+  MemberExpr *FoundMember = nullptr;
+  DeclRefExpr *FoundDeclRef = nullptr;
+};
+
+/// Given a declaration from a template pattern, find the corresponding
+/// declaration in the instantiated template. This allows hover to show
+/// concrete types and values instead of dependent ones.
+const NamedDecl *findInstantiatedDecl(
+    const NamedDecl *PatternDecl, const ASTContext &Ctx,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+  if (!PatternDecl || !TemplateCtx || TemplateCtx->TemplateArgs.empty())
+    return nullptr;
+
+  // Get the name to match
+  if (!PatternDecl->getDeclName().isIdentifier())
+    return nullptr;
+  StringRef DeclName = PatternDecl->getName();
+
+  // Check if this is a member of a class template
+  const DeclContext *DC = PatternDecl->getDeclContext();
+  if (const auto *RD = dyn_cast<CXXRecordDecl>(DC)) {
+    // Get the class template
+    const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+    if (!CTD) {
+      if (const auto *Spec = dyn_cast<ClassTemplateSpecializationDecl>(RD))
+        CTD = Spec->getSpecializedTemplate();
+    }
+    if (!CTD)
+      return nullptr;
+
+    // Find the matching specialization
+    for (ClassTemplateSpecializationDecl *Spec : CTD->specializations()) {
+      const TemplateArgumentList &Args = Spec->getTemplateArgs();
+      if (Args.size() > 0) {
+        PrintingPolicy PP(Ctx.getLangOpts());
+        std::string SpecArgStr;
+        llvm::raw_string_ostream OS(SpecArgStr);
+        Args.get(0).print(PP, OS, /*IncludeType=*/false);
+
+        if (SpecArgStr == TemplateCtx->TemplateArgs[0]) {
+          // Found matching specialization, look for the member
+          for (const Decl *D : Spec->decls()) {
+            if (const auto *ND = dyn_cast<NamedDecl>(D)) {
+              if (ND->getDeclName().isIdentifier() && ND->getName() == DeclName)
+                return ND;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Check if this is a local variable in a function template
+  if (const auto *FD = dyn_cast<FunctionDecl>(DC)) {
+    const FunctionTemplateDecl *FTD = FD->getDescribedFunctionTemplate();
+    if (!FTD) {
+      if (const auto *TInfo = FD->getTemplateSpecializationInfo())
+        FTD = TInfo->getTemplate();
+    }
+    if (!FTD)
+      return nullptr;
+
+    // Find the matching specialization
+    if (TemplateCtx->InstantiationID) {
+      for (FunctionDecl *Spec : FTD->specializations()) {
+        if (getSymbolID(Spec) == *TemplateCtx->InstantiationID) {
+          // Found, now search for the variable in the instantiated body
+          VarFinder Finder(DeclName);
+          Finder.TraverseDecl(Spec);
+          if (const VarDecl *InstVD = Finder.getFound())
+            return InstVD;
+          break;
+        }
+      }
+    }
+  }
+
+  return nullptr;
+}
+
 struct PrintExprResult {
   /// The evaluation result on expression `Expr`.
   std::optional<std::string> PrintedValue;
@@ -825,6 +1096,15 @@ HoverInfo getHoverContents(
   HoverInfo HI;
   auto &Ctx = D->getASTContext();
 
+  // If we have a template context, try to find the instantiated version of
+  // this declaration. This gives us concrete types and values instead of
+  // dependent ones.
+  if (TemplateCtx) {
+    if (const NamedDecl *InstD = findInstantiatedDecl(D, Ctx, TemplateCtx)) {
+      D = InstD;
+    }
+  }
+
   HI.AccessSpecifier = getAccessSpelling(D->getAccess()).str();
   HI.NamespaceScope = getNamespaceScope(D);
   if (!HI.NamespaceScope->empty())
@@ -861,10 +1141,33 @@ HoverInfo getHoverContents(
   // Fill in types and params.
   if (const FunctionDecl *FD = getUnderlyingFunction(D))
     fillFunctionTypeAndParams(HI, D, FD, PP);
+  else if (const auto *NTTP = dyn_cast<NonTypeTemplateParmDecl>(D)) {
+    HI.Type = printType(NTTP->getType(), Ctx, PP);
+    // If we have a template context, show the actual instantiated value
+    if (TemplateCtx && !TemplateCtx->TemplateArgs.empty()) {
+      unsigned Index = NTTP->getIndex();
+      if (Index < TemplateCtx->TemplateArgs.size()) {
+        HI.Value = TemplateCtx->TemplateArgs[Index];
+        HI.Documentation = "Template parameter instantiated as " + 
+                           TemplateCtx->TemplateArgs[Index];
+      }
+    }
+  }
   else if (const auto *VD = dyn_cast<ValueDecl>(D))
     HI.Type = printType(VD->getType(), Ctx, PP);
-  else if (const auto *TTP = dyn_cast<TemplateTypeParmDecl>(D))
-    HI.Type = TTP->wasDeclaredWithTypename() ? "typename" : "class";
+  else if (const auto *TTP = dyn_cast<TemplateTypeParmDecl>(D)) {
+    HI.Type = HoverInfo::PrintedType(
+        TTP->wasDeclaredWithTypename() ? "typename" : "class");
+    // If we have a template context, show the actual instantiated type
+    if (TemplateCtx && !TemplateCtx->TemplateArgs.empty()) {
+      unsigned Index = TTP->getIndex();
+      if (Index < TemplateCtx->TemplateArgs.size()) {
+        HI.Type = HoverInfo::PrintedType(TemplateCtx->TemplateArgs[Index].c_str());
+        HI.Documentation = "Template parameter instantiated as " + 
+                           TemplateCtx->TemplateArgs[Index];
+      }
+    }
+  }
   else if (const auto *TTP = dyn_cast<TemplateTemplateParmDecl>(D))
     HI.Type = printType(TTP, PP);
   else if (const auto *VT = dyn_cast<VarTemplateDecl>(D))
@@ -881,6 +1184,9 @@ HoverInfo getHoverContents(
       // If the value is dependent, try to get it from template instantiations
       if (!HI.Value)
         HI.Value = printDependentVarValue(Var, Ctx, TemplateCtx);
+      // For class template static members, try class template instantiations
+      if (!HI.Value)
+        HI.Value = printDependentClassMemberValue(Var, Ctx, TemplateCtx);
     }
   } else if (const auto *ECD = dyn_cast<EnumConstantDecl>(D)) {
     // Dependent enums (e.g. nested in template classes) don't have values yet.
@@ -1535,6 +1841,18 @@ getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
          const std::optional<TemplateInstantiationContext> &TemplateCtx) {
   static constexpr trace::Metric HoverCountMetric(
       "hover", trace::Metric::Counter, "case");
+
+  // Debug: log template context
+  if (TemplateCtx) {
+    vlog("getHover: TemplateCtx present, TemplateArgs={0}, InstantiationID={1}",
+         TemplateCtx->TemplateArgs.empty() ? "(empty)"
+                                           : TemplateCtx->TemplateArgs[0],
+         TemplateCtx->InstantiationID ? TemplateCtx->InstantiationID->str()
+                                      : "(none)");
+  } else {
+    vlog("getHover: No TemplateCtx");
+  }
+
   PrintingPolicy PP =
       getPrintingPolicy(AST.getASTContext().getPrintingPolicy());
   const SourceManager &SM = AST.getSourceManager();
@@ -1632,12 +1950,54 @@ getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
         if (!isa<NamespaceDecl>(DeclToUse))
           maybeAddSymbolProviders(AST, *HI,
                                   include_cleaner::Symbol{*DeclToUse});
-      } else if (const Expr *E = N->ASTNode.get<Expr>()) {
-        HoverCountMetric.record(1, "expr");
-        HI = getHoverContents(N, E, AST, PP, Index);
-      } else if (const Attr *A = N->ASTNode.get<Attr>()) {
-        HoverCountMetric.record(1, "attribute");
-        HI = getHoverContents(A, AST);
+      } else if (TemplateCtx && TemplateCtx->InstantiationID) {
+        // If we have a template context but couldn't find a declaration
+        // (e.g., dependent member access like a.rows), try to find the
+        // corresponding node in the instantiated function body.
+        vlog("getHover: Trying to find node in instantiated function, Offset={0}", Offset);
+        if (const FunctionDecl *InstFD =
+                findInstantiatedFunction(AST.getASTContext(), TemplateCtx)) {
+          vlog("getHover: Found instantiated function: {0}", InstFD->getNameAsString());
+          if (InstFD->hasBody()) {
+            InstantiatedMemberFinder Finder(SM, Offset);
+            Finder.TraverseStmt(const_cast<Stmt *>(InstFD->getBody()));
+
+            if (MemberExpr *ME = Finder.getFoundMember()) {
+              vlog("getHover: Found MemberExpr at position");
+              // Found a MemberExpr at the same location in instantiated code
+              if (const auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl())) {
+                HoverCountMetric.record(1, "instantiated_member");
+                HI = getHoverContents(ND, PP, Index, TB, std::nullopt);
+                if (!HI->Value) {
+                  // Try to evaluate the member expression
+                  HI->Value = printExprValue(ME, AST.getASTContext());
+                }
+              }
+            } else if (DeclRefExpr *DRE = Finder.getFoundDeclRef()) {
+              vlog("getHover: Found DeclRefExpr at position");
+              if (const auto *ND = dyn_cast<NamedDecl>(DRE->getDecl())) {
+                HoverCountMetric.record(1, "instantiated_declref");
+                HI = getHoverContents(ND, PP, Index, TB, std::nullopt);
+                if (!HI->Value)
+                  HI->Value = printExprValue(DRE, AST.getASTContext());
+              }
+            } else {
+              vlog("getHover: No member or declref found at offset {0}", Offset);
+            }
+          }
+        } else {
+          vlog("getHover: Could not find instantiated function");
+        }
+      }
+
+      if (!HI) {
+        if (const Expr *E = N->ASTNode.get<Expr>()) {
+          HoverCountMetric.record(1, "expr");
+          HI = getHoverContents(N, E, AST, PP, Index);
+        } else if (const Attr *A = N->ASTNode.get<Attr>()) {
+          HoverCountMetric.record(1, "attribute");
+          HI = getHoverContents(A, AST);
+        }
       }
       // FIXME: support hovers for other nodes?
       //  - built-in types

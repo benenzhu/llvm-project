@@ -1,159 +1,134 @@
 #!/usr/bin/env python3
-import json
+"""Simple test for goto definition and hover."""
+
 import subprocess
+import json
 import os
 import time
-import threading
 
 CLANGD_PATH = "/A/clangd-dev/build/bin/clangd"
-PROJECT_ROOT = "/A/clangd-dev/jumptest"
+TEST_FILE = "/A/clangd-dev/jumptest/jump2.cpp"
 
-class ClangdClient:
-    def __init__(self):
-        self.process = subprocess.Popen(
-            [CLANGD_PATH, "--log=verbose", f"--compile-commands-dir={PROJECT_ROOT}"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=PROJECT_ROOT
-        )
-        self.request_id = 0
-        self.stderr_lines = []
-        
-        self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
-        self.stderr_thread.start()
-        
-    def _read_stderr(self):
-        for line in self.process.stderr:
-            self.stderr_lines.append(line.decode().strip())
-            print(f"[STDERR] {line.decode().strip()}")
-            
-    def send_request(self, method, params):
-        self.request_id += 1
-        req_id = self.request_id
-        request = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+def main():
+    with open(TEST_FILE, 'r') as f:
+        file_content = f.read()
+    
+    proc = subprocess.Popen(
+        [CLANGD_PATH, "--log=verbose", "-j=4"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0
+    )
+    
+    req_id = 0
+    
+    def send(method, params, is_notification=False):
+        nonlocal req_id
+        request = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not is_notification:
+            req_id += 1
+            request["id"] = req_id
         content = json.dumps(request)
-        header = f"Content-Length: {len(content)}\r\n\r\n"
-        print(f"[SEND] {method} id={req_id}")
-        self.process.stdin.write(header.encode())
-        self.process.stdin.write(content.encode())
-        self.process.stdin.flush()
-        return self._wait_for_response(req_id)
+        message = f"Content-Length: {len(content)}\r\n\r\n{content}"
+        proc.stdin.write(message.encode())
+        proc.stdin.flush()
+        return req_id if not is_notification else None
     
-    def send_notification(self, method, params):
-        msg = {"jsonrpc": "2.0", "method": method, "params": params}
-        content = json.dumps(msg)
-        header = f"Content-Length: {len(content)}\r\n\r\n"
-        print(f"[SEND] {method} (notification)")
-        self.process.stdin.write(header.encode())
-        self.process.stdin.write(content.encode())
-        self.process.stdin.flush()
-    
-    def _wait_for_response(self, req_id, timeout=30):
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            msg = self._receive_one(timeout=1)
-            if msg is None:
-                continue
-            if "id" in msg and msg["id"] == req_id:
-                print(f"[RECV] Response for {req_id}: {json.dumps(msg)[:200]}")
-                return msg
-        print(f"[TIMEOUT] No response for {req_id}")
-        return None
-    
-    def _receive_one(self, timeout=10):
-        headers = {}
+    def recv(timeout=30):
+        import select
         header_data = b""
-        end_time = time.time() + timeout
-        
-        while time.time() < end_time:
-            byte = self.process.stdout.read(1)
-            if not byte:
-                time.sleep(0.01)
-                continue
-            header_data += byte
-            if header_data.endswith(b"\r\n\r\n"):
-                break
-        
-        if not header_data.endswith(b"\r\n\r\n"):
+        start = time.time()
+        while time.time() - start < timeout:
+            if select.select([proc.stdout], [], [], 0.1)[0]:
+                char = proc.stdout.read(1)
+                if not char:
+                    return None
+                header_data += char
+                if header_data.endswith(b"\r\n\r\n"):
+                    break
+        else:
             return None
-            
-        for line in header_data.decode().split("\r\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                headers[key.strip()] = value.strip()
         
-        content_length = int(headers.get("Content-Length", 0))
+        headers = {}
+        for line in header_data.decode().split('\r\n'):
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip()] = v.strip()
+        
+        content_length = int(headers.get('Content-Length', 0))
         if content_length > 0:
-            content = self.process.stdout.read(content_length).decode()
+            content = proc.stdout.read(content_length).decode()
             return json.loads(content)
         return None
     
-    def shutdown(self):
-        try:
-            self.send_request("shutdown", None)
-            self.send_notification("exit", None)
-        except:
-            pass
-        try:
-            self.process.terminate()
-            self.process.wait(timeout=2)
-        except:
-            self.process.kill()
-
-
-def main():
-    client = ClangdClient()
+    def wait_for(expected_id, timeout=30):
+        start = time.time()
+        while time.time() - start < timeout:
+            msg = recv(timeout=1)
+            if msg and msg.get('id') == expected_id:
+                return msg
+        return None
     
-    try:
-        # Initialize
-        client.send_request("initialize", {
-            "processId": os.getpid(),
-            "rootUri": f"file://{PROJECT_ROOT}",
-            "capabilities": {}
-        })
-        client.send_notification("initialized", {})
-        
-        # Open jump.cpp
-        with open(f"{PROJECT_ROOT}/jump.cpp") as f:
-            cpp_content = f.read()
-        
-        client.send_notification("textDocument/didOpen", {
-            "textDocument": {
-                "uri": f"file://{PROJECT_ROOT}/jump.cpp",
-                "languageId": "cpp",
-                "version": 1,
-                "text": cpp_content
-            }
-        })
-        
-        time.sleep(3)  # Wait for indexing
-        
-        # Jump to template definition
-        print("\n=== Jump from mma_AB(a) ===")
-        goto1 = client.send_request("textDocument/definition", {
-            "textDocument": {"uri": f"file://{PROJECT_ROOT}/jump.cpp"},
-            "position": {"line": 4, "character": 4}
-        })
-        
-        if goto1 and "result" in goto1:
-            print(f"Jump result: {goto1['result']}")
-        
-        # Hover on now in jump2.h (without opening it)
-        print("\n=== Hover on 'now' in jump2.h ===")
-        hover1 = client.send_request("textDocument/hover", {
-            "textDocument": {"uri": f"file://{PROJECT_ROOT}/jump2.h"},
-            "position": {"line": 2, "character": 16}
-        })
-        
-        if hover1:
-            print(f"Hover result: {json.dumps(hover1, indent=2)[:500]}")
-        
-    finally:
-        print("\n=== Shutting down ===")
-        client.shutdown()
-
+    # Initialize
+    print("Initializing...")
+    init_id = send("initialize", {
+        "processId": os.getpid(),
+        "rootUri": f"file:///A/clangd-dev/jumptest",
+        "capabilities": {}
+    })
+    resp = wait_for(init_id)
+    print(f"  Init response: {'OK' if resp else 'FAIL'}")
+    
+    send("initialized", {}, is_notification=True)
+    
+    # Open file
+    print(f"Opening {TEST_FILE}...")
+    send("textDocument/didOpen", {
+        "textDocument": {
+            "uri": f"file://{TEST_FILE}",
+            "languageId": "cpp",
+            "version": 1,
+            "text": file_content
+        }
+    }, is_notification=True)
+    
+    print("Waiting for indexing (10s)...")
+    time.sleep(10)
+    
+    # Goto definition from mma_AB(a) at line 18
+    print("\nGoto definition from mma_AB(a) at line 18, char 5...")
+    def_id = send("textDocument/definition", {
+        "textDocument": {"uri": f"file://{TEST_FILE}"},
+        "position": {"line": 17, "character": 5}
+    })
+    resp = wait_for(def_id)
+    print(f"  Response: {json.dumps(resp, indent=2) if resp else 'TIMEOUT'}")
+    
+    time.sleep(1)
+    
+    # Hover on 'now' at line 13
+    print("\nHover on 'now' at line 13, char 15...")
+    hover_id = send("textDocument/hover", {
+        "textDocument": {"uri": f"file://{TEST_FILE}"},
+        "position": {"line": 12, "character": 15}
+    })
+    resp = wait_for(hover_id)
+    if resp and resp.get('result'):
+        contents = resp['result'].get('contents', {})
+        value = contents.get('value', '') if isinstance(contents, dict) else str(contents)
+        print(f"  Hover result:\n{value[:500]}")
+    else:
+        print(f"  Response: {resp}")
+    
+    proc.terminate()
+    
+    # Print stderr
+    stderr = proc.stderr.read().decode()
+    print("\n=== Relevant logs ===")
+    for line in stderr.split('\n'):
+        if any(k in line for k in ["locateAST", "Candidate", "getHover", "Template"]):
+            print(line)
 
 if __name__ == "__main__":
     main()
-

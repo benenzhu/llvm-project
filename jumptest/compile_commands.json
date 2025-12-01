@@ -1,11 +1,17 @@
 [
   {
-    "arguments": [
-      "/usr/bin/g++",
-      "-c",
-      "jump.cpp"
-    ],
+    "arguments": ["g++", "-std=c++20", "-c", "jump.cpp"],
     "directory": "/A/clangd-dev/jumptest",
     "file": "/A/clangd-dev/jumptest/jump.cpp"
+  },
+  {
+    "arguments": ["g++", "-std=c++20", "-c", "jump2.cpp"],
+    "directory": "/A/clangd-dev/jumptest",
+    "file": "/A/clangd-dev/jumptest/jump2.cpp"
+  },
+  {
+    "arguments": ["g++", "-std=c++20", "-c", "jump3.cpp"],
+    "directory": "/A/clangd-dev/jumptest",
+    "file": "/A/clangd-dev/jumptest/jump3.cpp"
   }
 ]

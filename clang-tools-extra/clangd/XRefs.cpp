@@ -384,6 +384,107 @@ bool objcMethodIsTouched(const SourceManager &SM, const ObjCMethodDecl *OMD,
   return false;
 }
 
+/// AST visitor to find a DeclRefExpr or MemberExpr at a specific source
+/// location in an instantiated function body.
+class InstantiatedDeclFinder : public RecursiveASTVisitor<InstantiatedDeclFinder> {
+public:
+  InstantiatedDeclFinder(const SourceManager &SM, unsigned TargetOffset)
+      : SM(SM), TargetOffset(TargetOffset) {}
+
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    unsigned Offset = SM.getFileOffset(SM.getSpellingLoc(DRE->getLocation()));
+    if (TargetOffset >= Offset && TargetOffset <= Offset + 30) {
+      FoundDecl = DRE->getDecl();
+      return false;
+    }
+    return true;
+  }
+
+  bool VisitMemberExpr(MemberExpr *ME) {
+    unsigned Offset = SM.getFileOffset(SM.getSpellingLoc(ME->getMemberLoc()));
+    if (TargetOffset >= Offset && TargetOffset <= Offset + 30) {
+      FoundDecl = ME->getMemberDecl();
+      return false;
+    }
+    return true;
+  }
+
+  const NamedDecl *getFoundDecl() const { return FoundDecl; }
+
+private:
+  const SourceManager &SM;
+  unsigned TargetOffset;
+  const NamedDecl *FoundDecl = nullptr;
+};
+
+/// Find the instantiated function matching the template context.
+const FunctionDecl *findInstantiatedFunctionForJump(
+    const ASTContext &Ctx,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+  if (!TemplateCtx || !TemplateCtx->InstantiationID)
+    return nullptr;
+
+  // Helper to recursively search
+  std::function<const FunctionDecl *(const DeclContext *)> SearchInContext =
+      [&](const DeclContext *DC) -> const FunctionDecl * {
+    for (const Decl *D : DC->decls()) {
+      if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D)) {
+        for (FunctionDecl *Spec : FTD->specializations()) {
+          if (getSymbolID(Spec) == *TemplateCtx->InstantiationID)
+            return Spec;
+        }
+      }
+      if (const auto *ND = dyn_cast<NamespaceDecl>(D)) {
+        if (auto *Found = SearchInContext(ND))
+          return Found;
+      }
+      if (const auto *RD = dyn_cast<CXXRecordDecl>(D)) {
+        if (auto *Found = SearchInContext(RD))
+          return Found;
+      }
+      if (const auto *LS = dyn_cast<LinkageSpecDecl>(D)) {
+        if (auto *Found = SearchInContext(LS))
+          return Found;
+      }
+    }
+    return nullptr;
+  };
+
+  return SearchInContext(Ctx.getTranslationUnitDecl());
+}
+
+/// Find a class template specialization matching the template context.
+const ClassTemplateSpecializationDecl *findInstantiatedClassForJump(
+    const ASTContext &Ctx,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+  if (!TemplateCtx || !TemplateCtx->InstantiationID)
+    return nullptr;
+
+  std::function<const ClassTemplateSpecializationDecl *(const DeclContext *)>
+      SearchInContext = [&](const DeclContext *DC)
+      -> const ClassTemplateSpecializationDecl * {
+    for (const Decl *D : DC->decls()) {
+      if (const auto *CTD = dyn_cast<ClassTemplateDecl>(D)) {
+        for (ClassTemplateSpecializationDecl *Spec : CTD->specializations()) {
+          if (getSymbolID(Spec) == *TemplateCtx->InstantiationID)
+            return Spec;
+        }
+      }
+      if (const auto *ND = dyn_cast<NamespaceDecl>(D)) {
+        if (auto *Found = SearchInContext(ND))
+          return Found;
+      }
+      if (const auto *LS = dyn_cast<LinkageSpecDecl>(D)) {
+        if (auto *Found = SearchInContext(LS))
+          return Found;
+      }
+    }
+    return nullptr;
+  };
+
+  return SearchInContext(Ctx.getTranslationUnitDecl());
+}
+
 // Decls are more complicated.
 // The AST contains at least a declaration, maybe a definition.
 // These are up-to-date, and so generally preferred over index results.
@@ -395,6 +496,17 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
                   const std::optional<TemplateInstantiationContext>
                       &ActiveTemplateCtx = std::nullopt) {
   const SourceManager &SM = AST.getSourceManager();
+  
+  // Debug: log the position
+  if (CurLoc.isValid()) {
+    auto PLoc = SM.getPresumedLoc(CurLoc);
+    vlog("locateASTReferent: CurLoc at {0}:{1}:{2}, TouchedIdentifier={3}",
+         PLoc.getFilename(), PLoc.getLine(), PLoc.getColumn(),
+         TouchedIdentifier ? TouchedIdentifier->text(SM).str() : "(null)");
+  } else {
+    vlog("locateASTReferent: CurLoc is invalid!");
+  }
+  
   // Results follow the order of Symbols.Decls.
   std::vector<LocatedSymbol> Result;
 
@@ -455,6 +567,59 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
       DeclRelation::TemplateInstantiation | DeclRelation::TemplatePattern;
   auto InstantiationCandidates =
       getDeclAtPositionWithRelations(AST, CurLoc, InstantiationRelations);
+  
+  // Debug logging for template instantiation detection
+  vlog("locateASTReferent: Candidates.size()={0}, InstantiationCandidates.size()={1}",
+       Candidates.size(), InstantiationCandidates.size());
+  for (const auto &E : Candidates) {
+    bool hasTemplatePattern = static_cast<bool>(E.second & DeclRelation::TemplatePattern);
+    bool hasTemplateInst = static_cast<bool>(E.second & DeclRelation::TemplateInstantiation);
+    vlog("  Candidate: {0}, TemplatePattern={1}, TemplateInstantiation={2}", 
+         E.first->getNameAsString(), hasTemplatePattern, hasTemplateInst);
+  }
+  for (const auto &Cand : InstantiationCandidates) {
+    bool hasTemplatePattern = static_cast<bool>(Cand.second & DeclRelation::TemplatePattern);
+    bool hasTemplateInst = static_cast<bool>(Cand.second & DeclRelation::TemplateInstantiation);
+    vlog("  InstantiationCandidate: {0}, TemplatePattern={1}, TemplateInstantiation={2}", 
+         Cand.first->getNameAsString(), hasTemplatePattern, hasTemplateInst);
+    vlog("    DeclKind={0}", Cand.first->getDeclKindName());
+    if (const auto *FD = dyn_cast<FunctionDecl>(Cand.first)) {
+      auto *TSI = FD->getTemplateSpecializationInfo();
+      if (TSI) {
+        vlog("    HasTemplateSpecializationInfo=true");
+        if (TSI->TemplateArguments) {
+          vlog("    TemplateArguments.size()={0}", TSI->TemplateArguments->size());
+        }
+      } else {
+        vlog("    HasTemplateSpecializationInfo=false");
+        // Try alternative way to get template arguments
+        if (auto *FTD = FD->getPrimaryTemplate()) {
+          vlog("    PrimaryTemplate={0}", FTD->getNameAsString());
+        }
+        // Check if it's a member specialization
+        if (FD->isFunctionTemplateSpecialization()) {
+          vlog("    isFunctionTemplateSpecialization=true");
+        }
+        // Try to get template arguments from the type
+        if (auto TAL = FD->getTemplateSpecializationArgs()) {
+          vlog("    TemplateSpecializationArgs.size()={0}", TAL->size());
+          for (unsigned I = 0; I < TAL->size(); ++I) {
+            PrintingPolicy PP(FD->getASTContext().getLangOpts());
+            std::string ArgStr;
+            llvm::raw_string_ostream OS(ArgStr);
+            TAL->get(I).print(PP, OS, /*IncludeType=*/true);
+            vlog("      Arg[{0}]={1}", I, ArgStr);
+          }
+        }
+      }
+      if (const auto *Pattern = FD->getTemplateInstantiationPattern()) {
+        vlog("    TemplateInstantiationPattern={0}", Pattern->getNameAsString());
+      }
+    } else {
+      vlog("    Not a FunctionDecl");
+    }
+  }
+  
   llvm::DenseSet<SymbolID> VirtualMethods;
   for (const auto &E : Candidates) {
     const NamedDecl *D = E.first;
@@ -542,24 +707,32 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
     // Check if D is a template pattern and we have an instantiation
     const FunctionDecl *InstantiationForContext = nullptr;
     if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
+      vlog("locateASTReferent: D is FunctionDecl: {0}", FD->getNameAsString());
       // If D is the template pattern, look for the original instantiation
       // in the separate instantiation candidates.
       // IMPORTANT: InstantiationCandidates should contain only the instantiation
       // that corresponds to the current call site. We verify this by checking
       // that the instantiation's pattern matches D.
       for (const auto &Cand : InstantiationCandidates) {
+        vlog("  Checking InstantiationCandidate: {0}", Cand.first->getNameAsString());
         if (Cand.second & DeclRelation::TemplateInstantiation) {
           if (const auto *InstFD = dyn_cast<FunctionDecl>(Cand.first)) {
             // Check if this instantiation's pattern is our function
             const FunctionDecl *Pattern = InstFD->getTemplateInstantiationPattern();
+            vlog("    InstFD={0}, Pattern={1}", InstFD->getNameAsString(), 
+                 Pattern ? Pattern->getNameAsString() : "(null)");
             if (Pattern == FD || 
                 (Pattern && FD->getDescribedFunctionTemplate() && 
                  Pattern == FD->getDescribedFunctionTemplate()->getTemplatedDecl())) {
               InstantiationForContext = InstFD;
+              vlog("    Found matching instantiation!");
               break;
             }
           }
         }
+      }
+      if (!InstantiationForContext) {
+        vlog("  No InstantiationForContext found");
       }
     }
     AddResultDecl(D, InstantiationForContext);
@@ -570,97 +743,106 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
                                     Index, MainFilePath);
   Result.insert(Result.end(), Overrides.begin(), Overrides.end());
 
-  // If we have a template context and multiple overloaded results, try to
-  // filter to the one that would be selected in the instantiated context.
-  if (ActiveTemplateCtx && ActiveTemplateCtx->InstantiationID &&
-      Result.size() > 1) {
-    elog("locateASTReferent: Have template context, {0} results, looking for InstantiationID {1}",
-         Result.size(), ActiveTemplateCtx->InstantiationID->str());
-    
-    // Find the template instantiation - first try in Candidates
+  // If we have multiple overloaded results, try to filter to the one that
+  // would be selected in the instantiated context.
+  if (Result.size() > 1) {
     const FunctionDecl *InstFD = nullptr;
-    for (const auto &E : Candidates) {
-      if (const auto *FD = dyn_cast<FunctionDecl>(E.first)) {
-        elog("  Checking candidate {0} (ID: {1})", FD->getNameAsString(), 
-             getSymbolID(FD).str());
-        if (getSymbolID(FD) == *ActiveTemplateCtx->InstantiationID) {
-          InstFD = FD;
-          elog("  Found InstFD by direct ID match!");
-          break;
-        }
-        // Also check the pattern
-        if (FD->getTemplateInstantiationPattern()) {
-          if (getSymbolID(FD->getTemplateInstantiationPattern()) ==
-              ActiveTemplateCtx->TemplatePatternID) {
+    
+    // Strategy 1: Use ActiveTemplateCtx if available
+    if (ActiveTemplateCtx && ActiveTemplateCtx->InstantiationID) {
+      // Find the template instantiation - first try in Candidates
+      for (const auto &E : Candidates) {
+        if (const auto *FD = dyn_cast<FunctionDecl>(E.first)) {
+          if (getSymbolID(FD) == *ActiveTemplateCtx->InstantiationID) {
             InstFD = FD;
-            elog("  Found InstFD by pattern match!");
             break;
+          }
+          if (FD->getTemplateInstantiationPattern()) {
+            if (getSymbolID(FD->getTemplateInstantiationPattern()) ==
+                ActiveTemplateCtx->TemplatePatternID) {
+              InstFD = FD;
+              break;
+            }
+          }
+        }
+      }
+
+      // If not found in Candidates, try to find via the template's specializations
+      if (!InstFD) {
+        for (const Decl *D : AST.getASTContext().getTranslationUnitDecl()->decls()) {
+          if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D)) {
+            if (getSymbolID(FTD->getTemplatedDecl()) ==
+                ActiveTemplateCtx->TemplatePatternID) {
+              for (FunctionDecl *Spec : FTD->specializations()) {
+                if (getSymbolID(Spec) == *ActiveTemplateCtx->InstantiationID) {
+                  InstFD = Spec;
+                  break;
+                }
+              }
+              if (InstFD)
+                break;
+            }
           }
         }
       }
     }
 
-    // If not found in Candidates, try to find via the template's specializations
-    // This is needed for cross-file jumps where the instantiation is in another
-    // file
+    // Strategy 2: If no ActiveTemplateCtx, check if we're inside a template
+    // function and find any of its instantiations
     if (!InstFD) {
-      // Find any function template in the AST that matches the pattern
-      // and check its specializations
-      for (const Decl *D : AST.getASTContext().getTranslationUnitDecl()->decls()) {
-        if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D)) {
-          if (getSymbolID(FTD->getTemplatedDecl()) ==
-              ActiveTemplateCtx->TemplatePatternID) {
+      // Find the enclosing function at CurLoc
+      const DeclContext *DC = nullptr;
+      auto &Ctx = AST.getASTContext();
+      
+      // Use the first candidate's DeclContext to find the enclosing function
+      for (const auto &E : Candidates) {
+        if (const auto *ND = dyn_cast<NamedDecl>(E.first)) {
+          // Walk up to find enclosing function
+          DC = ND->getDeclContext();
+          while (DC && !isa<FunctionDecl>(DC) && !isa<TranslationUnitDecl>(DC))
+            DC = DC->getParent();
+          break;
+        }
+      }
+      
+      // If we found an enclosing function template, get any specialization
+      if (DC) {
+        if (const auto *EnclosingFD = dyn_cast<FunctionDecl>(DC)) {
+          if (const auto *FTD = EnclosingFD->getDescribedFunctionTemplate()) {
+            // Get first available specialization
             for (FunctionDecl *Spec : FTD->specializations()) {
-              if (getSymbolID(Spec) == *ActiveTemplateCtx->InstantiationID) {
+              if (Spec->hasBody()) {
                 InstFD = Spec;
+                vlog("locateASTReferent: Using specialization {0} for filtering",
+                     Spec->getNameAsString());
                 break;
               }
             }
-            if (InstFD)
-              break;
           }
         }
       }
     }
 
-    // If we found the instantiation, look at its body to find the actual call
-    // that would be made, and filter results to just that overload.
+    // If we found an instantiation, search for the actual callee
     if (InstFD && InstFD->hasBody()) {
-      elog("locateASTReferent: Found instantiation {0}, searching for call at offset {1}",
-           InstFD->getNameAsString(), SM.getFileOffset(SM.getSpellingLoc(CurLoc)));
-      
-      // Find what function would actually be called at this location in the
-      // instantiated function. We search for call expressions at the
-      // corresponding location.
       class CallFinder : public RecursiveASTVisitor<CallFinder> {
       public:
         CallFinder(SourceLocation TargetLoc, const SourceManager &SM)
-            : TargetLoc(TargetLoc), SM(SM), TargetOffset(SM.getFileOffset(SM.getSpellingLoc(TargetLoc))) {}
+            : SM(SM), TargetOffset(SM.getFileOffset(SM.getSpellingLoc(TargetLoc))) {}
 
         bool VisitCallExpr(CallExpr *CE) {
-          // Get the callee expression (the function name part)
           Expr *CalleeExpr = CE->getCallee();
           if (!CalleeExpr)
             return true;
-            
-          // Get the source range of the callee (function name)
+
           SourceLocation BeginLoc = SM.getSpellingLoc(CalleeExpr->getBeginLoc());
-          SourceLocation EndLoc = SM.getSpellingLoc(CalleeExpr->getEndLoc());
-          
-          if (!BeginLoc.isValid() || !EndLoc.isValid())
+          if (!BeginLoc.isValid())
             return true;
-            
+
           unsigned BeginOffset = SM.getFileOffset(BeginLoc);
-          unsigned EndOffset = SM.getFileOffset(EndLoc);
-          
-          elog("  CallFinder: Found call, callee range [{0}, {1}], target {2}",
-               BeginOffset, EndOffset, TargetOffset);
-          
-          // Check if target location is within the callee expression range
-          // Add some tolerance for the end (function name length)
-          if (TargetOffset >= BeginOffset && TargetOffset <= EndOffset + 20) {
+          // Check if target location is near the callee
+          if (TargetOffset >= BeginOffset && TargetOffset <= BeginOffset + 50) {
             if (const auto *Callee = CE->getDirectCallee()) {
-              elog("  CallFinder: Found callee {0}", Callee->getNameAsString());
               FoundCallee = Callee;
               return false;
             }
@@ -671,7 +853,6 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
         const FunctionDecl *getFoundCallee() const { return FoundCallee; }
 
       private:
-        SourceLocation TargetLoc;
         const SourceManager &SM;
         unsigned TargetOffset;
         const FunctionDecl *FoundCallee = nullptr;
@@ -681,8 +862,9 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
       Finder.TraverseDecl(const_cast<FunctionDecl *>(InstFD));
 
       if (const FunctionDecl *Callee = Finder.getFoundCallee()) {
-        // Found the actual callee in the instantiation, filter results
         SymbolID CalleeID = getSymbolID(Callee);
+        vlog("locateASTReferent: Found callee {0} in instantiation, filtering",
+             Callee->getNameAsString());
         std::vector<LocatedSymbol> FilteredResult;
         for (auto &R : Result) {
           if (R.ID == CalleeID) {
@@ -982,7 +1164,9 @@ locateSymbolAt(ParsedAST &AST, Position Pos, const SymbolIndex *Index,
   const syntax::Token *TouchedIdentifier = nullptr;
   auto TokensTouchingCursor =
       syntax::spelledTokensTouching(*CurLoc, AST.getTokens());
+  vlog("locateSymbolAt: TokensTouchingCursor.size()={0}", TokensTouchingCursor.size());
   for (const syntax::Token &Tok : TokensTouchingCursor) {
+    vlog("  Token: kind={0}, text={1}", tok::getTokenName(Tok.kind()), Tok.text(SM).str());
     if (Tok.kind() == tok::identifier) {
       if (auto Macro = locateMacroReferent(Tok, AST, MainFilePath))
         // Don't look at the AST or index if we have a macro result.
@@ -1013,6 +1197,95 @@ locateSymbolAt(ParsedAST &AST, Position Pos, const SymbolIndex *Index,
                                       ActiveTemplateCtx);
   if (!ASTResults.empty())
     return ASTResults;
+
+  // If we have a template context but couldn't resolve directly (e.g., D::rows
+  // where D is a template parameter), try to find in the instantiated function.
+  if (ActiveTemplateCtx && ActiveTemplateCtx->InstantiationID) {
+    if (const FunctionDecl *InstFD =
+            findInstantiatedFunctionForJump(AST.getASTContext(), ActiveTemplateCtx)) {
+      if (InstFD->hasBody()) {
+        unsigned Offset = SM.getFileOffset(*CurLoc);
+        InstantiatedDeclFinder Finder(SM, Offset);
+        Finder.TraverseStmt(const_cast<Stmt *>(InstFD->getBody()));
+
+        if (const NamedDecl *FoundDecl = Finder.getFoundDecl()) {
+          vlog("locateSymbolAt: Found decl in instantiation: {0}",
+               FoundDecl->getNameAsString());
+          LocatedSymbol Result;
+          Result.Name = printName(AST.getASTContext(), *FoundDecl);
+          Result.ID = getSymbolID(FoundDecl);
+          if (auto Loc = makeLocation(AST.getASTContext(),
+                                      nameLocation(*FoundDecl, SM), MainFilePath))
+            Result.PreferredDeclaration = *Loc;
+          if (const NamedDecl *Def = getDefinition(FoundDecl))
+            Result.Definition = makeLocation(AST.getASTContext(),
+                                             nameLocation(*Def, SM), MainFilePath);
+          
+          // If the found decl is a member of a class template specialization,
+          // record the class template context for subsequent hover operations.
+          if (const DeclContext *DC = FoundDecl->getDeclContext()) {
+            if (const auto *CTSD = dyn_cast<ClassTemplateSpecializationDecl>(DC)) {
+              TemplateInstantiationContext ClassCtx;
+              // Get the pattern (the class template)
+              if (const ClassTemplateDecl *CTD = CTSD->getSpecializedTemplate()) {
+                ClassCtx.TemplatePatternID = getSymbolID(CTD->getTemplatedDecl());
+                ClassCtx.TemplateFile = Result.PreferredDeclaration.uri.file();
+              }
+              ClassCtx.InstantiationID = getSymbolID(CTSD);
+              // Extract template arguments
+              const TemplateArgumentList &Args = CTSD->getTemplateArgs();
+              PrintingPolicy PP(AST.getASTContext().getLangOpts());
+              PP.SuppressTagKeyword = true;
+              for (unsigned I = 0; I < Args.size(); ++I) {
+                std::string ArgStr;
+                llvm::raw_string_ostream OS(ArgStr);
+                Args.get(I).print(PP, OS, /*IncludeType=*/false);
+                ClassCtx.TemplateArgs.push_back(ArgStr);
+              }
+              vlog("locateSymbolAt: Recording class template context with {0} args",
+                   ClassCtx.TemplateArgs.size());
+              Result.TemplateContext = std::move(ClassCtx);
+            }
+          }
+          
+          return {std::move(Result)};
+        }
+      }
+    }
+    
+    // If function template lookup failed, try class template lookup
+    // This handles cases like hovering on _rows inside class template rt<...>
+    if (const ClassTemplateSpecializationDecl *InstClass =
+            findInstantiatedClassForJump(AST.getASTContext(), ActiveTemplateCtx)) {
+      unsigned Offset = SM.getFileOffset(*CurLoc);
+      // Search in the class body for a matching decl
+      for (const Decl *D : InstClass->decls()) {
+        if (const auto *ND = dyn_cast<NamedDecl>(D)) {
+          SourceLocation DeclLoc = ND->getLocation();
+          if (DeclLoc.isValid()) {
+            unsigned DeclOffset = SM.getFileOffset(SM.getSpellingLoc(DeclLoc));
+            // Check if target position is near this decl
+            if (Offset >= DeclOffset && Offset <= DeclOffset + 50) {
+              vlog("locateSymbolAt: Found decl in class instantiation: {0}",
+                   ND->getNameAsString());
+              LocatedSymbol Result;
+              Result.Name = printName(AST.getASTContext(), *ND);
+              Result.ID = getSymbolID(ND);
+              if (auto Loc = makeLocation(AST.getASTContext(),
+                                          nameLocation(*ND, SM), MainFilePath))
+                Result.PreferredDeclaration = *Loc;
+              if (const NamedDecl *Def = getDefinition(ND))
+                Result.Definition = makeLocation(AST.getASTContext(),
+                                                 nameLocation(*Def, SM), MainFilePath);
+              // Keep the class template context
+              Result.TemplateContext = ActiveTemplateCtx;
+              return {std::move(Result)};
+            }
+          }
+        }
+      }
+    }
+  }
 
   // If the cursor can't be resolved directly, try fallback strategies.
   auto Word =

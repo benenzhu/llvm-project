@@ -267,7 +267,7 @@ bool Dex::fuzzyFind(const FuzzyFindRequest &Req,
   // final score might not be retrieved otherwise.
   // FIXME(kbobyrev): Tune this ratio.
   if (Req.Limit)
-    Root = Corpus.limit(std::move(Root), *Req.Limit * 100);
+    Root = Corpus.limit(std::move(Root), *Req.Limit * 1000);
   SPAN_ATTACH(Tracer, "query", llvm::to_string(*Root));
   vlog("Dex query tree: {0}", *Root);
 

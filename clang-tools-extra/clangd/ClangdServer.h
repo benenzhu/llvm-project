@@ -528,12 +528,20 @@ private:
   // Used to provide concrete values when hovering in template definitions.
   mutable std::mutex TemplateContextMutex;
   std::optional<TemplateInstantiationContext> ActiveTemplateContext;
+  // History of recent template contexts to support jumping back
+  std::vector<TemplateInstantiationContext> TemplateContextHistory;
+  static constexpr size_t MaxTemplateContextHistory = 10;
 
 public:
   // Set the active template context (called after locateSymbolAt)
   void setTemplateContext(std::optional<TemplateInstantiationContext> Ctx);
+  // Push current context to history before replacing
+  void pushTemplateContextToHistory();
   // Get the active template context (called during hover)
   std::optional<TemplateInstantiationContext> getTemplateContext() const;
+  // Get template context from history that matches the given file
+  std::optional<TemplateInstantiationContext> 
+  getTemplateContextFromHistory(llvm::StringRef File) const;
   // Clear the template context
   void clearTemplateContext();
 };
