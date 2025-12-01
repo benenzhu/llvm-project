@@ -1,0 +1,194 @@
+# Clangd Template Context Enhancement
+
+## 项目概述
+
+本项目为 clangd 添加了**模板实例化上下文跟踪**功能。当用户从模板调用点跳转到模板定义时，clangd 会记住具体的模板实例化信息，使得后续的 hover 和跳转操作能够显示正确的实例化相关信息。
+
+## 实现的功能
+
+### 1. 模板上下文记录
+当从模板调用点（如 `mma_AB(a)` 其中 `a` 是 `rt<float>`）跳转时：
+- 记录 `InstantiationID`（具体实例化的符号 ID）
+- 记录 `TemplatePatternID`（模板模式的符号 ID）
+- 记录 `TemplateArgs`（模板参数，如 `float`）
+- 记录 `OriginFile` 和 `OriginPosition`（跳转起点）
+
+### 2. Hover 显示具体实例化的值
+在模板定义内 hover 依赖变量时：
+- 从 `float` 实例化跳转后：`now` 显示 `Value = 4`（sizeof(float)）
+- 从 `double` 实例化跳转后：`now` 显示 `Value = 8`（sizeof(double)）
+
+### 3. 跳转到正确的重载函数
+在模板定义内跳转依赖调用时：
+- 从 `float` 实例化跳转后：`mma_AB_base` 只跳到 `mma_AB_base(float*)`
+- 从 `double` 实例化跳转后：`mma_AB_base` 只跳到 `mma_AB_base(double*)`
+
+### 4. Hover 显示正确的重载参数
+- 从 `float` 实例化跳转后：`mma_AB_base` hover 显示 `float * a`
+- 从 `double` 实例化跳转后：`mma_AB_base` hover 显示 `double * a`
+
+### 5. 上下文保持
+- 在模板内部点击变量定义（如 `now`）不会清除上下文
+- 只有跳出模板文件才会清除上下文
+
+## 修改的文件
+
+### clang-tools-extra/clangd/XRefs.h
+- 添加 `TemplateInstantiationContext` 结构体
+- 添加 `OriginFile` 和 `OriginPosition` 字段
+- 修改 `LocatedSymbol` 添加 `TemplateContext` 字段
+- 修改 `locateSymbolAt` 函数签名接受 `ActiveTemplateCtx` 参数
+
+### clang-tools-extra/clangd/XRefs.cpp
+- `locateASTReferent`: 添加模板实例化上下文记录逻辑
+- `locateASTReferent`: 添加基于上下文的重载过滤（使用 `CallFinder` 在实例化函数中查找实际被调用的函数）
+- 修复位置匹配逻辑：检查目标位置是否在 `CallExpr` 的 callee 范围内
+
+### clang-tools-extra/clangd/ClangdServer.h
+- 添加 `ActiveTemplateContext` 成员变量
+- 添加 `setTemplateContext`, `getTemplateContext`, `clearTemplateContext` 方法
+
+### clang-tools-extra/clangd/ClangdServer.cpp
+- `locateSymbolAt`: 传递和更新模板上下文
+- `findHover`: 传递模板上下文给 `getHover`
+- 修改上下文清除逻辑：只有跳出模板文件/原始文件才清除
+
+### clang-tools-extra/clangd/Hover.h
+- 修改 `getHover` 函数签名接受 `TemplateCtx` 参数
+
+### clang-tools-extra/clangd/Hover.cpp
+- `printDependentVarValue`: 使用 `TemplateCtx` 过滤实例化，只显示对应实例化的值
+- `pickDeclToUse`: 使用 `TemplateCtx` 过滤重载声明
+- `getHoverContents`: 传递 `TemplateCtx`
+
+## 测试
+
+### 测试文件
+测试文件位于 `/A/clangd-dev/jumptest/` 目录：
+
+- `jump2.cpp` - 主测试文件，包含模板和重载函数
+- `test_both_types.py` - 测试 float 和 double 两种实例化
+- `test_user_flow.py` - 模拟用户实际操作流程
+- `test_single_file.py` - 单文件模板测试
+- `test_debug_log.py` - 带调试日志的测试
+
+### 运行测试
+
+```bash
+# 编译 clangd (Release 版本)
+cd /A/clangd-dev/build
+cmake -DCMAKE_BUILD_TYPE=Release .
+mold -run ninja clangd
+
+# 运行 Python 测试
+cd /A/clangd-dev/jumptest
+python3 test_both_types.py    # 测试两种类型的实例化
+python3 test_user_flow.py     # 测试用户操作流程
+
+# 运行单元测试
+cd /A/clangd-dev/build
+./tools/clang/tools/extra/clangd/unittests/ClangdTests --gtest_filter="*Hover*"
+./tools/clang/tools/extra/clangd/unittests/ClangdTests --gtest_filter="*DependentVarValue*"
+```
+
+### 测试用例 (jump2.cpp)
+
+```cpp
+void mma_AB_base(int* a){ }
+void mma_AB_base(float* a){ }
+void mma_AB_base(double* a){ }
+
+template<typename T> 
+struct rt{
+    static constexpr int rows = sizeof(T);
+    T tiles[rows];
+};
+
+template<typename T>
+static inline void mma_AB(T a){ 
+    const auto now = a.rows;    // hover: Value = 4 (from float) 或 8 (from double)
+    mma_AB_base(a.tiles);       // jump: 跳到正确的重载
+}
+
+int main(){
+    rt<float> a;
+    mma_AB(a);      // 从这里跳转 → T=float
+    rt<double> b; 
+    mma_AB(b);      // 从这里跳转 → T=double
+}
+```
+
+## 构建命令
+
+```bash
+# Debug 版本（用于开发调试）
+cd /A/clangd-dev/build
+cmake -DCMAKE_BUILD_TYPE=Debug .
+mold -run ninja clangd
+
+# Release 版本（用于日常使用）
+cd /A/clangd-dev/build
+cmake -DCMAKE_BUILD_TYPE=Release .
+mold -run ninja clangd
+```
+
+## clangd 路径
+
+Release 版本的 clangd 位于：
+```
+/A/clangd-dev/build/bin/clangd
+```
+
+## 技术细节
+
+### CallFinder 类
+用于在实例化函数的 AST 中查找特定位置的函数调用，关键是检查目标位置是否在 `CallExpr` 的 callee 表达式范围内：
+
+```cpp
+bool VisitCallExpr(CallExpr *CE) {
+    Expr *CalleeExpr = CE->getCallee();
+    unsigned BeginOffset = SM.getFileOffset(SM.getSpellingLoc(CalleeExpr->getBeginLoc()));
+    // 检查目标位置是否在 callee 范围内（+20 容差）
+    if (TargetOffset >= BeginOffset && TargetOffset <= BeginOffset + 20) {
+        if (const auto *Callee = CE->getDirectCallee()) {
+            FoundCallee = Callee;
+            return false;
+        }
+    }
+    return true;
+}
+```
+
+### 上下文保持逻辑
+在 `ClangdServer::locateSymbolAt` 中，只有跳出模板文件或原始文件时才清除上下文：
+
+```cpp
+bool keepContext = (TargetFile == CurrentCtx->TemplateFile ||
+                    TargetFile == CurrentCtx->OriginFile ||
+                    TargetFile == CurrentFile);
+```
+
+## 已知限制
+
+1. **跨文件上下文**：当模板定义在头文件中时，需要使用原始 .cpp 文件的 AST（尚未完全实现）
+2. **多重嵌套模板**：目前只支持单层模板实例化上下文
+3. **类模板成员函数**：目前主要测试了函数模板
+
+## 相关文件结构
+
+```
+/A/clangd-dev/
+├── clang-tools-extra/clangd/
+│   ├── XRefs.h          # TemplateInstantiationContext 定义
+│   ├── XRefs.cpp        # locateSymbolAt 实现
+│   ├── Hover.h          # getHover 声明
+│   ├── Hover.cpp        # hover 实现
+│   ├── ClangdServer.h   # 服务器类声明
+│   └── ClangdServer.cpp # 服务器实现
+├── build/
+│   └── bin/clangd       # 编译输出
+└── jumptest/
+    ├── jump2.cpp        # 测试文件
+    └── test_*.py        # Python 测试脚本
+```
+
