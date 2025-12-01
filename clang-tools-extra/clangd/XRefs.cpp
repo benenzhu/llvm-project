@@ -1195,10 +1195,63 @@ locateSymbolAt(ParsedAST &AST, Position Pos, const SymbolIndex *Index,
     }
   }
 
+  // FIRST: Check if we're on a dependent type member (like RT::layout) BEFORE
+  // calling locateASTReferent, as that might return wrong results for dependent types.
+  if (ActiveTemplateCtx && !ActiveTemplateCtx->TemplateArgs.empty()) {
+    unsigned Offset = SM.getFileOffset(*CurLoc);
+    SelectionTree ST = SelectionTree::createRight(AST.getASTContext(), 
+                                                   AST.getTokens(), Offset, Offset);
+    if (const SelectionTree::Node *N = ST.commonAncestor()) {
+      if (const TypeLoc *TL = N->ASTNode.get<TypeLoc>()) {
+        QualType QT = TL->getType();
+        if (QT->isDependentType()) {
+          if (const auto *DNT = QT->getAs<DependentNameType>()) {
+            std::string MemberName = DNT->getIdentifier()->getName().str();
+            vlog("locateSymbolAt: Found dependent type member '{0}', searching in instantiated class",
+                 MemberName);
+            
+            // Search in the instantiated class for this type member
+            if (const FunctionDecl *InstFD = 
+                    findInstantiatedFunctionForJump(AST.getASTContext(), ActiveTemplateCtx)) {
+              // Get the template argument type and search for the member
+              for (unsigned I = 0; I < InstFD->getNumParams(); ++I) {
+                QualType ParamType = InstFD->getParamDecl(I)->getType();
+                ParamType = ParamType.getNonReferenceType();
+                if (ParamType->isPointerType())
+                  ParamType = ParamType->getPointeeType();
+                
+                if (const auto *RD = ParamType->getAsCXXRecordDecl()) {
+                  // Search for the type member in this class
+                  for (const auto *D : RD->decls()) {
+                    if (const auto *TD = dyn_cast<TypedefNameDecl>(D)) {
+                      if (TD->getName() == MemberName) {
+                        vlog("locateSymbolAt: Found type member {0} in class {1}",
+                             MemberName, RD->getNameAsString());
+                        LocatedSymbol Result;
+                        Result.Name = printName(AST.getASTContext(), *TD);
+                        Result.ID = getSymbolID(TD);
+                        if (auto Loc = makeLocation(AST.getASTContext(),
+                                                    nameLocation(*TD, SM), MainFilePath))
+                          Result.PreferredDeclaration = *Loc;
+                        Result.Definition = Result.PreferredDeclaration;
+                        return {std::move(Result)};
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   ASTNodeKind NodeKind;
   auto ASTResults = locateASTReferent(*CurLoc, TouchedIdentifier, AST,
                                       MainFilePath, Index, NodeKind,
                                       ActiveTemplateCtx);
+  
   if (!ASTResults.empty())
     return ASTResults;
 

@@ -1153,8 +1153,30 @@ HoverInfo getHoverContents(
       }
     }
   }
-  else if (const auto *VD = dyn_cast<ValueDecl>(D))
-    HI.Type = printType(VD->getType(), Ctx, PP);
+  else if (const auto *VD = dyn_cast<ValueDecl>(D)) {
+    QualType VarType = VD->getType();
+    HI.Type = printType(VarType, Ctx, PP);
+    
+    // If the type is dependent and we have a template context,
+    // try to resolve the instantiated type from the actual instantiation
+    if (VarType->isDependentType() && TemplateCtx && 
+        !TemplateCtx->TemplateArgs.empty()) {
+      // For ParmVarDecl, find the corresponding parameter in the instantiated function
+      if (const auto *PVD = dyn_cast<ParmVarDecl>(VD)) {
+        if (const FunctionDecl *InstFD = 
+                findInstantiatedFunction(Ctx, TemplateCtx)) {
+          unsigned ParamIndex = PVD->getFunctionScopeIndex();
+          if (ParamIndex < InstFD->getNumParams()) {
+            const ParmVarDecl *InstParam = InstFD->getParamDecl(ParamIndex);
+            QualType InstType = InstParam->getType();
+            HI.Type = printType(InstType, Ctx, PP);
+            vlog("getHoverContents: Resolved dependent param type to {0}",
+                 HI.Type->Type);
+          }
+        }
+      }
+    }
+  }
   else if (const auto *TTP = dyn_cast<TemplateTypeParmDecl>(D)) {
     HI.Type = HoverInfo::PrintedType(
         TTP->wasDeclaredWithTypename() ? "typename" : "class");
@@ -1987,6 +2009,34 @@ getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
           }
         } else {
           vlog("getHover: Could not find instantiated function");
+        }
+      }
+      
+      // If still no HI and we have TemplateCtx, check if this is a dependent type
+      // like RT::layout - try to resolve it using the instantiated type
+      if (!HI && TemplateCtx && !TemplateCtx->TemplateArgs.empty()) {
+        if (const TypeLoc *TL = N->ASTNode.get<TypeLoc>()) {
+          QualType QT = TL->getType();
+          if (QT->isDependentType()) {
+            // Try to get the member name from DependentNameType
+            std::string MemberName;
+            if (const auto *DNT = QT->getAs<DependentNameType>()) {
+              MemberName = DNT->getIdentifier()->getName().str();
+            }
+            if (!MemberName.empty()) {
+              vlog("getHover: Found dependent type member '{0}', resolving with TemplateCtx", 
+                   MemberName);
+              HI.emplace();
+              HI->Name = MemberName;
+              HI->Kind = index::SymbolKind::TypeAlias;
+              HI->Type.emplace();
+              HI->Type->Type = TemplateCtx->TemplateArgs[0] + "::" + MemberName;
+              HI->Definition = "using " + MemberName + " = /* type alias in " + 
+                              TemplateCtx->TemplateArgs[0] + " */";
+              HI->Documentation = "Template-dependent type member. "
+                                 "Instantiated from: " + TemplateCtx->TemplateArgs[0];
+            }
+          }
         }
       }
 

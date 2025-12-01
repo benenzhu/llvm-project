@@ -801,6 +801,13 @@ void ClangdServer::applyTweak(PathRef File, Range Sel, StringRef TweakID,
 void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
                                   Callback<std::vector<LocatedSymbol>> CB) {
   auto CurrentCtx = getTemplateContext();
+  // If no active context, try to get from cache for this file
+  if (!CurrentCtx) {
+    CurrentCtx = getTemplateContextFromCache(File);
+    if (CurrentCtx) {
+      vlog("locateSymbolAt: Using cached context for file {0}", File);
+    }
+  }
   auto CurrentFile = File.str();
 
   auto Action = [Pos, CB = std::move(CB), CurrentCtx, CurrentFile,
@@ -835,10 +842,17 @@ void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
                           TargetFile == CurrentCtx->OriginFile ||
                           TargetFile == CurrentFile);
       
+      vlog("locateSymbolAt: keepContext check - TargetFile={0}, TemplateFile={1}, "
+           "OriginFile={2}, CurrentFile={3}, keepContext={4}",
+           TargetFile, CurrentCtx->TemplateFile, CurrentCtx->OriginFile,
+           CurrentFile, keepContext);
+      
       if (!keepContext) {
-        // Before clearing, try to find a suitable context from history
-        // that matches the target file
+        // Before clearing, save the current context to history so hover can still use it
         auto *Server = const_cast<ClangdServer *>(this);
+        Server->pushTemplateContextToHistory();
+        
+        // Try to find a suitable context from history that matches the target file
         std::lock_guard<std::mutex> Lock(Server->TemplateContextMutex);
         bool foundInHistory = false;
         for (auto it = Server->TemplateContextHistory.rbegin();
@@ -895,6 +909,13 @@ void ClangdServer::findDocumentHighlights(
 void ClangdServer::findHover(PathRef File, Position Pos,
                              Callback<std::optional<HoverInfo>> CB) {
   auto TemplateCtx = getTemplateContext();
+  // If no active context, try to get from cache for this file
+  if (!TemplateCtx) {
+    TemplateCtx = getTemplateContextFromCache(File);
+    if (TemplateCtx) {
+      vlog("findHover: Using cached context for file {0}", File);
+    }
+  }
   // Also get a context from history in case the main one doesn't apply
   auto HistoryCtx = getTemplateContextFromHistory(File);
 
@@ -1272,6 +1293,12 @@ void ClangdServer::setTemplateContext(
     }
   }
   ActiveTemplateContext = std::move(Ctx);
+  
+  // Also update the global cache - this persists even when ActiveTemplateContext
+  // is cleared, so we can always look up the last known context for a template.
+  if (ActiveTemplateContext && !ActiveTemplateContext->TemplateFile.empty()) {
+    TemplateContextCache[ActiveTemplateContext->TemplateFile] = *ActiveTemplateContext;
+  }
 }
 
 void ClangdServer::pushTemplateContextToHistory() {
@@ -1290,6 +1317,15 @@ ClangdServer::getTemplateContext() const {
 }
 
 std::optional<TemplateInstantiationContext>
+ClangdServer::getTemplateContextFromCache(llvm::StringRef File) const {
+  std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  auto it = TemplateContextCache.find(File.str());
+  if (it != TemplateContextCache.end())
+    return it->second;
+  return std::nullopt;
+}
+
+std::optional<TemplateInstantiationContext>
 ClangdServer::getTemplateContextFromHistory(llvm::StringRef File) const {
   std::lock_guard<std::mutex> Lock(TemplateContextMutex);
   // Search history from most recent to oldest
@@ -1305,6 +1341,7 @@ ClangdServer::getTemplateContextFromHistory(llvm::StringRef File) const {
 void ClangdServer::clearTemplateContext() {
   std::lock_guard<std::mutex> Lock(TemplateContextMutex);
   ActiveTemplateContext = std::nullopt;
+  // Note: We don't clear the cache - it persists until a new context is set
 }
 
 } // namespace clangd
