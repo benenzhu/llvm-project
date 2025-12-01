@@ -5015,6 +5015,42 @@ TEST(Hover, FunctionParameters) {
   }
 }
 
+// Test that hovering on a dependent variable in a template function shows
+// the value from instantiations.
+TEST(Hover, DependentVarValueFromInstantiation) {
+  const char *Code = R"cpp(
+    template<typename T>
+    struct rt {
+      static constexpr int rows = sizeof(T);
+      T tiles[rows];
+    };
+
+    template<typename T>
+    void mma_AB(T a) {
+      const auto [[^now]] = a.rows;
+    }
+
+    void test() {
+      rt<float> a;
+      mma_AB(a);
+      rt<int> b;
+      mma_AB(b);
+    }
+  )cpp";
+
+  Annotations T(Code);
+  TestTU TU = TestTU::withCode(T.code());
+  TU.ExtraArgs.push_back("-std=c++17");
+  auto AST = TU.build();
+  auto H = getHover(AST, T.point(), format::getLLVMStyle(), nullptr);
+  ASSERT_TRUE(H);
+  EXPECT_EQ(H->Name, "now");
+  // The value should come from one of the instantiations
+  // Both rt<float> and rt<int> have rows = 4, so we expect "4"
+  ASSERT_TRUE(H->Value.has_value());
+  EXPECT_TRUE(H->Value->find("4") != std::string::npos);
+}
+
 } // namespace
 } // namespace clangd
 } // namespace clang

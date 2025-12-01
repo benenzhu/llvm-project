@@ -11,6 +11,7 @@
 
 #include "ParsedAST.h"
 #include "Protocol.h"
+#include "XRefs.h"
 #include "support/Markup.h"
 #include "clang/Index/IndexSymbol.h"
 #include <optional>
@@ -164,9 +165,14 @@ inline bool operator==(const HoverInfo::Param &LHS,
 }
 
 /// Get the hover information when hovering at \p Pos.
-std::optional<HoverInfo> getHover(ParsedAST &AST, Position Pos,
-                                  const format::FormatStyle &Style,
-                                  const SymbolIndex *Index);
+/// If TemplateCtx is provided, it contains template instantiation context
+/// from a previous jump operation, which can be used to show concrete values
+/// for template-dependent expressions.
+std::optional<HoverInfo>
+getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
+         const SymbolIndex *Index,
+         const std::optional<TemplateInstantiationContext> &TemplateCtx =
+             std::nullopt);
 
 } // namespace clangd
 } // namespace clang

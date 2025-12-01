@@ -523,6 +523,19 @@ private:
   DraftStore DraftMgr;
 
   std::unique_ptr<ThreadsafeFS> DirtyFS;
+
+  // Template instantiation context for the most recent jump.
+  // Used to provide concrete values when hovering in template definitions.
+  mutable std::mutex TemplateContextMutex;
+  std::optional<TemplateInstantiationContext> ActiveTemplateContext;
+
+public:
+  // Set the active template context (called after locateSymbolAt)
+  void setTemplateContext(std::optional<TemplateInstantiationContext> Ctx);
+  // Get the active template context (called during hover)
+  std::optional<TemplateInstantiationContext> getTemplateContext() const;
+  // Clear the template context
+  void clearTemplateContext();
 };
 
 } // namespace clangd

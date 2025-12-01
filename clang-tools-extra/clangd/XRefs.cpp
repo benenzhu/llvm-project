@@ -391,14 +391,17 @@ bool objcMethodIsTouched(const SourceManager &SM, const ObjCMethodDecl *OMD,
 std::vector<LocatedSymbol>
 locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
                   ParsedAST &AST, llvm::StringRef MainFilePath,
-                  const SymbolIndex *Index, ASTNodeKind &NodeKind) {
+                  const SymbolIndex *Index, ASTNodeKind &NodeKind,
+                  const std::optional<TemplateInstantiationContext>
+                      &ActiveTemplateCtx = std::nullopt) {
   const SourceManager &SM = AST.getSourceManager();
   // Results follow the order of Symbols.Decls.
   std::vector<LocatedSymbol> Result;
 
   static constexpr trace::Metric LocateASTReferentMetric(
       "locate_ast_referent", trace::Metric::Counter, "case");
-  auto AddResultDecl = [&](const NamedDecl *D) {
+  auto AddResultDecl = [&](const NamedDecl *D,
+                           const FunctionDecl *Instantiation = nullptr) {
     D = getPreferredDecl(D);
     auto Loc =
         makeLocation(AST.getASTContext(), nameLocation(*D, SM), MainFilePath);
@@ -412,6 +415,32 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
     if (const NamedDecl *Def = getDefinition(D))
       Result.back().Definition = makeLocation(
           AST.getASTContext(), nameLocation(*Def, SM), MainFilePath);
+
+    // If jumping from a template instantiation, record the context
+    if (Instantiation) {
+      if (const auto *TSI = Instantiation->getTemplateSpecializationInfo()) {
+        if (const auto *TAL = TSI->TemplateArguments) {
+          TemplateInstantiationContext Ctx;
+          Ctx.TemplatePatternID = getSymbolID(D);
+          Ctx.TemplateFile = Loc->uri.file();
+          Ctx.TemplateRange = Loc->range;
+          Ctx.InstantiationID = getSymbolID(Instantiation);
+          // Record the origin file (where the template call was made)
+          Ctx.OriginFile = MainFilePath.str();
+
+          // Extract template arguments as strings
+          PrintingPolicy PP(AST.getASTContext().getLangOpts());
+          PP.SuppressTagKeyword = true;
+          for (unsigned I = 0; I < TAL->size(); ++I) {
+            std::string ArgStr;
+            llvm::raw_string_ostream OS(ArgStr);
+            TAL->get(I).print(PP, OS, /*IncludeType=*/false);
+            Ctx.TemplateArgs.push_back(ArgStr);
+          }
+          Result.back().TemplateContext = std::move(Ctx);
+        }
+      }
+    }
   };
 
   // Emit all symbol locations (declaration or definition) from AST.
@@ -419,6 +448,13 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
       DeclRelation::TemplatePattern | DeclRelation::Alias;
   auto Candidates =
       getDeclAtPositionWithRelations(AST, CurLoc, Relations, &NodeKind);
+
+  // Separately query for template instantiation info to track context,
+  // but don't include these in normal results.
+  DeclRelationSet InstantiationRelations =
+      DeclRelation::TemplateInstantiation | DeclRelation::TemplatePattern;
+  auto InstantiationCandidates =
+      getDeclAtPositionWithRelations(AST, CurLoc, InstantiationRelations);
   llvm::DenseSet<SymbolID> VirtualMethods;
   for (const auto &E : Candidates) {
     const NamedDecl *D = E.first;
@@ -503,13 +539,163 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
 
     LocateASTReferentMetric.record(1, "regular");
     // Otherwise the target declaration is the right one.
-    AddResultDecl(D);
+    // Check if D is a template pattern and we have an instantiation
+    const FunctionDecl *InstantiationForContext = nullptr;
+    if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
+      // If D is the template pattern, look for the original instantiation
+      // in the separate instantiation candidates.
+      // IMPORTANT: InstantiationCandidates should contain only the instantiation
+      // that corresponds to the current call site. We verify this by checking
+      // that the instantiation's pattern matches D.
+      for (const auto &Cand : InstantiationCandidates) {
+        if (Cand.second & DeclRelation::TemplateInstantiation) {
+          if (const auto *InstFD = dyn_cast<FunctionDecl>(Cand.first)) {
+            // Check if this instantiation's pattern is our function
+            const FunctionDecl *Pattern = InstFD->getTemplateInstantiationPattern();
+            if (Pattern == FD || 
+                (Pattern && FD->getDescribedFunctionTemplate() && 
+                 Pattern == FD->getDescribedFunctionTemplate()->getTemplatedDecl())) {
+              InstantiationForContext = InstFD;
+              break;
+            }
+          }
+        }
+      }
+    }
+    AddResultDecl(D, InstantiationForContext);
   }
   enhanceLocatedSymbolsFromIndex(Result, Index, MainFilePath);
 
   auto Overrides = findImplementors(VirtualMethods, RelationKind::OverriddenBy,
                                     Index, MainFilePath);
   Result.insert(Result.end(), Overrides.begin(), Overrides.end());
+
+  // If we have a template context and multiple overloaded results, try to
+  // filter to the one that would be selected in the instantiated context.
+  if (ActiveTemplateCtx && ActiveTemplateCtx->InstantiationID &&
+      Result.size() > 1) {
+    elog("locateASTReferent: Have template context, {0} results, looking for InstantiationID {1}",
+         Result.size(), ActiveTemplateCtx->InstantiationID->str());
+    
+    // Find the template instantiation - first try in Candidates
+    const FunctionDecl *InstFD = nullptr;
+    for (const auto &E : Candidates) {
+      if (const auto *FD = dyn_cast<FunctionDecl>(E.first)) {
+        elog("  Checking candidate {0} (ID: {1})", FD->getNameAsString(), 
+             getSymbolID(FD).str());
+        if (getSymbolID(FD) == *ActiveTemplateCtx->InstantiationID) {
+          InstFD = FD;
+          elog("  Found InstFD by direct ID match!");
+          break;
+        }
+        // Also check the pattern
+        if (FD->getTemplateInstantiationPattern()) {
+          if (getSymbolID(FD->getTemplateInstantiationPattern()) ==
+              ActiveTemplateCtx->TemplatePatternID) {
+            InstFD = FD;
+            elog("  Found InstFD by pattern match!");
+            break;
+          }
+        }
+      }
+    }
+
+    // If not found in Candidates, try to find via the template's specializations
+    // This is needed for cross-file jumps where the instantiation is in another
+    // file
+    if (!InstFD) {
+      // Find any function template in the AST that matches the pattern
+      // and check its specializations
+      for (const Decl *D : AST.getASTContext().getTranslationUnitDecl()->decls()) {
+        if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D)) {
+          if (getSymbolID(FTD->getTemplatedDecl()) ==
+              ActiveTemplateCtx->TemplatePatternID) {
+            for (FunctionDecl *Spec : FTD->specializations()) {
+              if (getSymbolID(Spec) == *ActiveTemplateCtx->InstantiationID) {
+                InstFD = Spec;
+                break;
+              }
+            }
+            if (InstFD)
+              break;
+          }
+        }
+      }
+    }
+
+    // If we found the instantiation, look at its body to find the actual call
+    // that would be made, and filter results to just that overload.
+    if (InstFD && InstFD->hasBody()) {
+      elog("locateASTReferent: Found instantiation {0}, searching for call at offset {1}",
+           InstFD->getNameAsString(), SM.getFileOffset(SM.getSpellingLoc(CurLoc)));
+      
+      // Find what function would actually be called at this location in the
+      // instantiated function. We search for call expressions at the
+      // corresponding location.
+      class CallFinder : public RecursiveASTVisitor<CallFinder> {
+      public:
+        CallFinder(SourceLocation TargetLoc, const SourceManager &SM)
+            : TargetLoc(TargetLoc), SM(SM), TargetOffset(SM.getFileOffset(SM.getSpellingLoc(TargetLoc))) {}
+
+        bool VisitCallExpr(CallExpr *CE) {
+          // Get the callee expression (the function name part)
+          Expr *CalleeExpr = CE->getCallee();
+          if (!CalleeExpr)
+            return true;
+            
+          // Get the source range of the callee (function name)
+          SourceLocation BeginLoc = SM.getSpellingLoc(CalleeExpr->getBeginLoc());
+          SourceLocation EndLoc = SM.getSpellingLoc(CalleeExpr->getEndLoc());
+          
+          if (!BeginLoc.isValid() || !EndLoc.isValid())
+            return true;
+            
+          unsigned BeginOffset = SM.getFileOffset(BeginLoc);
+          unsigned EndOffset = SM.getFileOffset(EndLoc);
+          
+          elog("  CallFinder: Found call, callee range [{0}, {1}], target {2}",
+               BeginOffset, EndOffset, TargetOffset);
+          
+          // Check if target location is within the callee expression range
+          // Add some tolerance for the end (function name length)
+          if (TargetOffset >= BeginOffset && TargetOffset <= EndOffset + 20) {
+            if (const auto *Callee = CE->getDirectCallee()) {
+              elog("  CallFinder: Found callee {0}", Callee->getNameAsString());
+              FoundCallee = Callee;
+              return false;
+            }
+          }
+          return true;
+        }
+
+        const FunctionDecl *getFoundCallee() const { return FoundCallee; }
+
+      private:
+        SourceLocation TargetLoc;
+        const SourceManager &SM;
+        unsigned TargetOffset;
+        const FunctionDecl *FoundCallee = nullptr;
+      };
+
+      CallFinder Finder(CurLoc, SM);
+      Finder.TraverseDecl(const_cast<FunctionDecl *>(InstFD));
+
+      if (const FunctionDecl *Callee = Finder.getFoundCallee()) {
+        // Found the actual callee in the instantiation, filter results
+        SymbolID CalleeID = getSymbolID(Callee);
+        std::vector<LocatedSymbol> FilteredResult;
+        for (auto &R : Result) {
+          if (R.ID == CalleeID) {
+            FilteredResult.push_back(std::move(R));
+            break;
+          }
+        }
+        if (!FilteredResult.empty())
+          return FilteredResult;
+      }
+    }
+  }
+
   return Result;
 }
 
@@ -776,8 +962,10 @@ const syntax::Token *findNearbyIdentifier(const SpelledWord &Word,
   return BestTok;
 }
 
-std::vector<LocatedSymbol> locateSymbolAt(ParsedAST &AST, Position Pos,
-                                          const SymbolIndex *Index) {
+std::vector<LocatedSymbol>
+locateSymbolAt(ParsedAST &AST, Position Pos, const SymbolIndex *Index,
+               const std::optional<TemplateInstantiationContext>
+                   &ActiveTemplateCtx) {
   const auto &SM = AST.getSourceManager();
   auto MainFilePath = AST.tuPath();
 
@@ -821,7 +1009,8 @@ std::vector<LocatedSymbol> locateSymbolAt(ParsedAST &AST, Position Pos,
 
   ASTNodeKind NodeKind;
   auto ASTResults = locateASTReferent(*CurLoc, TouchedIdentifier, AST,
-                                      MainFilePath, Index, NodeKind);
+                                      MainFilePath, Index, NodeKind,
+                                      ActiveTemplateCtx);
   if (!ASTResults.empty())
     return ASTResults;
 

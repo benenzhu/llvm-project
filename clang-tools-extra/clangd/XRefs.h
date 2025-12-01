@@ -38,6 +38,30 @@ class ParsedAST;
 //  - a declaration and a distinct definition (e.g. function declared in header)
 //  - a declaration and an equal definition (e.g. inline function, or class)
 // For some types of symbol, e.g. macros, definition == declaration always.
+/// Context for template instantiation during jump operations.
+/// When jumping from a template instantiation call (e.g., mma_AB(a) where
+/// a is rt<float>), this stores the instantiation information so that
+/// subsequent hover operations can show concrete values.
+struct TemplateInstantiationContext {
+  /// The template function/class being instantiated (the pattern)
+  SymbolID TemplatePatternID;
+  /// Location range of the template definition
+  Range TemplateRange;
+  /// The file containing the template definition
+  std::string TemplateFile;
+  /// String representation of template arguments (e.g., "float", "int")
+  std::vector<std::string> TemplateArgs;
+  /// The specific instantiation's SymbolID (if available)
+  std::optional<SymbolID> InstantiationID;
+  /// The original file where the template call was made (e.g., "jump.cpp")
+  /// This is used to maintain context across multiple header files.
+  /// When querying symbols in header files, we should use this file's AST
+  /// because it contains the actual template instantiations.
+  std::string OriginFile;
+  /// The position in the origin file where the template was called
+  Position OriginPosition;
+};
+
 struct LocatedSymbol {
   // The (unqualified) name of the symbol.
   std::string Name;
@@ -47,12 +71,18 @@ struct LocatedSymbol {
   std::optional<Location> Definition;
   // SymbolID of the located symbol if available.
   SymbolID ID;
+  // Template instantiation context if jumping from a template call
+  std::optional<TemplateInstantiationContext> TemplateContext;
 };
 llvm::raw_ostream &operator<<(llvm::raw_ostream &, const LocatedSymbol &);
 /// Get definition of symbol at a specified \p Pos.
 /// Multiple locations may be returned, corresponding to distinct symbols.
-std::vector<LocatedSymbol> locateSymbolAt(ParsedAST &AST, Position Pos,
-                                          const SymbolIndex *Index = nullptr);
+/// If ActiveTemplateCtx is provided, it may be used to filter overloaded
+/// functions based on the template instantiation context from a previous jump.
+std::vector<LocatedSymbol>
+locateSymbolAt(ParsedAST &AST, Position Pos, const SymbolIndex *Index = nullptr,
+               const std::optional<TemplateInstantiationContext>
+                   &ActiveTemplateCtx = std::nullopt);
 
 // Tries to provide a textual fallback for locating a symbol by looking up the
 // word under the cursor as a symbol name in the index.

@@ -800,11 +800,46 @@ void ClangdServer::applyTweak(PathRef File, Range Sel, StringRef TweakID,
 
 void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
                                   Callback<std::vector<LocatedSymbol>> CB) {
-  auto Action = [Pos, CB = std::move(CB),
+  auto CurrentCtx = getTemplateContext();
+  auto CurrentFile = File.str();
+
+  auto Action = [Pos, CB = std::move(CB), CurrentCtx, CurrentFile,
                  this](llvm::Expected<InputsAndAST> InpAST) mutable {
     if (!InpAST)
       return CB(InpAST.takeError());
-    CB(clangd::locateSymbolAt(InpAST->AST, Pos, Index));
+    // Pass the current template context to potentially filter overloads
+    auto Results = clangd::locateSymbolAt(InpAST->AST, Pos, Index, CurrentCtx);
+    // If jumping to a template definition, store the template context
+    // for use in subsequent hover operations.
+    if (!Results.empty() && Results[0].TemplateContext) {
+      // Also record the origin file and position for future queries
+      auto Ctx = Results[0].TemplateContext;
+      if (Ctx->OriginFile.empty()) {
+        Ctx->OriginFile = CurrentFile;
+        Ctx->OriginPosition = Pos;
+      }
+      const_cast<ClangdServer *>(this)->setTemplateContext(std::move(Ctx));
+    } else if (!Results.empty() && CurrentCtx) {
+      // Decide whether to keep the template context:
+      // Keep it if we're still in the template file (jumping within the template)
+      // or if we're in the origin file
+      auto &FirstResult = Results[0];
+      std::string TargetFile =
+          FirstResult.PreferredDeclaration.uri.file().str();
+      
+      // Keep context if:
+      // 1. Target is the same file as the template definition, OR
+      // 2. Target is the origin file, OR
+      // 3. We're jumping within the current file (local jump like variable definition)
+      bool keepContext = (TargetFile == CurrentCtx->TemplateFile ||
+                          TargetFile == CurrentCtx->OriginFile ||
+                          TargetFile == CurrentFile);
+      
+      if (!keepContext) {
+        const_cast<ClangdServer *>(this)->clearTemplateContext();
+      }
+    }
+    CB(std::move(Results));
   };
 
   WorkScheduler->runWithAST("Definitions", File, std::move(Action));
@@ -844,13 +879,17 @@ void ClangdServer::findDocumentHighlights(
 
 void ClangdServer::findHover(PathRef File, Position Pos,
                              Callback<std::optional<HoverInfo>> CB) {
-  auto Action = [File = File.str(), Pos, CB = std::move(CB),
+  auto TemplateCtx = getTemplateContext();
+
+  auto Action = [File = File.str(), Pos, CB = std::move(CB), TemplateCtx,
                  this](llvm::Expected<InputsAndAST> InpAST) mutable {
     if (!InpAST)
       return CB(InpAST.takeError());
+
     format::FormatStyle Style = getFormatStyleForFile(
         File, InpAST->Inputs.Contents, *InpAST->Inputs.TFS, false);
-    CB(clangd::getHover(InpAST->AST, Pos, std::move(Style), Index));
+    CB(clangd::getHover(InpAST->AST, Pos, std::move(Style), Index,
+                        std::move(TemplateCtx)));
   };
 
   WorkScheduler->runWithAST("Hover", File, std::move(Action), Transient);
@@ -1188,5 +1227,23 @@ void ClangdServer::profile(MemoryTree &MT) const {
     BackgroundIdx->profile(MT.child("background_index"));
   WorkScheduler->profile(MT.child("tuscheduler"));
 }
+
+void ClangdServer::setTemplateContext(
+    std::optional<TemplateInstantiationContext> Ctx) {
+  std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  ActiveTemplateContext = std::move(Ctx);
+}
+
+std::optional<TemplateInstantiationContext>
+ClangdServer::getTemplateContext() const {
+  std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  return ActiveTemplateContext;
+}
+
+void ClangdServer::clearTemplateContext() {
+  std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+  ActiveTemplateContext = std::nullopt;
+}
+
 } // namespace clangd
 } // namespace clang

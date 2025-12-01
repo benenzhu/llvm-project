@@ -39,6 +39,7 @@
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LLVM.h"
@@ -470,6 +471,211 @@ std::optional<std::string> printExprValue(const Expr *E,
   return Constant.Val.getAsString(Ctx, T);
 }
 
+// When a variable's value is dependent on template parameters, try to get
+// its value from a template instantiation.
+// For example:
+//   template<typename T> void foo() {
+//     const auto now = sizeof(T);  // 'now' is value-dependent
+//   }
+//   foo<float>();  // In this instantiation, now = 4
+//
+// When hovering on 'now' in the template definition, we can look at existing
+// instantiations to show a concrete value.
+
+namespace {
+// Helper visitor to find a variable by name within a function body
+class VarFinder : public RecursiveASTVisitor<VarFinder> {
+public:
+  VarFinder(StringRef Name) : TargetName(Name) {}
+
+  bool VisitVarDecl(VarDecl *VD) {
+    if (VD->getDeclName().isIdentifier() && VD->getName() == TargetName) {
+      Found = VD;
+      return false; // Stop traversal
+    }
+    return true;
+  }
+
+  VarDecl *getFound() const { return Found; }
+
+private:
+  StringRef TargetName;
+  VarDecl *Found = nullptr;
+};
+} // namespace
+
+// Get size of a type by name (common types)
+std::optional<uint64_t> getSizeOfType(StringRef TypeName,
+                                      const ASTContext &Ctx) {
+  if (TypeName == "float")
+    return 4;
+  if (TypeName == "double")
+    return 8;
+  if (TypeName == "int" || TypeName == "unsigned int")
+    return 4;
+  if (TypeName == "long" || TypeName == "unsigned long")
+    return Ctx.getTargetInfo().getLongWidth() / 8;
+  if (TypeName == "char" || TypeName == "unsigned char" ||
+      TypeName == "signed char")
+    return 1;
+  if (TypeName == "short" || TypeName == "unsigned short")
+    return 2;
+  if (TypeName == "long long" || TypeName == "unsigned long long")
+    return 8;
+  return std::nullopt;
+}
+
+// Try to compute the value of a dependent expression given known template args
+std::optional<std::string> computeValueFromTemplateArg(
+    const Expr *Init, StringRef TypeArg, const ASTContext &Ctx) {
+  // Handle sizeof(T) where T is the template parameter
+  if (const auto *UETT = dyn_cast<UnaryExprOrTypeTraitExpr>(Init)) {
+    if (UETT->getKind() == UETT_SizeOf) {
+      if (auto Size = getSizeOfType(TypeArg, Ctx))
+        return std::to_string(*Size);
+    }
+  }
+
+  // Handle member access like a.rows where rows = sizeof(T)
+  // We look for DependentScopeDeclRefExpr or MemberExpr patterns
+  if (const auto *ME = dyn_cast<MemberExpr>(Init)) {
+    // Check if member is a constexpr defined as sizeof(T)
+    if (const auto *VD = dyn_cast<VarDecl>(ME->getMemberDecl())) {
+      if (VD->isConstexpr() || VD->hasInit()) {
+        if (const Expr *MemberInit = VD->getInit()) {
+          // Recursively try to compute
+          return computeValueFromTemplateArg(MemberInit, TypeArg, Ctx);
+        }
+      }
+    }
+  }
+
+  // Handle implicit cast expressions
+  if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Init)) {
+    return computeValueFromTemplateArg(ICE->getSubExpr(), TypeArg, Ctx);
+  }
+
+  return std::nullopt;
+}
+
+std::optional<std::string> printDependentVarValue(
+    const VarDecl *VD, const ASTContext &Ctx,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+  if (!VD || !VD->getInit() || !VD->getInit()->isValueDependent())
+    return std::nullopt;
+
+  // Find the enclosing function
+  const DeclContext *DC = VD->getDeclContext();
+  const FunctionDecl *FD = nullptr;
+  while (DC) {
+    if (const auto *F = dyn_cast<FunctionDecl>(DC)) {
+      FD = F;
+      break;
+    }
+    DC = DC->getParent();
+  }
+  if (!FD)
+    return std::nullopt;
+
+  // Check if this function is a template pattern
+  const FunctionTemplateDecl *FTD = FD->getDescribedFunctionTemplate();
+  if (!FTD) {
+    // Maybe FD is already an instantiation pattern, try to get the template
+    if (const auto *TInfo = FD->getTemplateSpecializationInfo())
+      FTD = TInfo->getTemplate();
+  }
+  if (!FTD)
+    return std::nullopt;
+
+  // Get variable name to match in instantiations
+  if (!VD->getDeclName().isIdentifier())
+    return std::nullopt;
+  StringRef VarName = VD->getName();
+
+  // If we have a template context from a previous jump, try to find the
+  // specific instantiation that matches
+  FunctionDecl *TargetInstantiation = nullptr;
+  if (TemplateCtx && TemplateCtx->InstantiationID) {
+    for (FunctionDecl *Spec : FTD->specializations()) {
+      if (getSymbolID(Spec) == *TemplateCtx->InstantiationID) {
+        TargetInstantiation = Spec;
+        break;
+      }
+    }
+  }
+
+  // Collect values from instantiations
+  llvm::SmallVector<std::string, 4> Values;
+
+  auto ProcessInstantiation = [&](FunctionDecl *Spec) {
+    if (!Spec->hasBody())
+      return;
+
+    // Use AST visitor to find the variable in the function body
+    VarFinder Finder(VarName);
+    Finder.TraverseDecl(Spec);
+    const VarDecl *InstVD = Finder.getFound();
+    if (!InstVD)
+      return;
+
+    // Found matching variable, try to evaluate its initializer
+    if (const Expr *Init = InstVD->getInit()) {
+      if (!Init->isValueDependent()) {
+        if (auto Val = printExprValue(Init, Ctx)) {
+          Values.push_back(*Val);
+        }
+      }
+    }
+  };
+
+  // If we have a target instantiation from context, only use that one
+  if (TargetInstantiation) {
+    ProcessInstantiation(TargetInstantiation);
+  } else {
+    // Otherwise, collect from all instantiations
+    for (FunctionDecl *Spec : FTD->specializations()) {
+      ProcessInstantiation(Spec);
+    }
+  }
+
+  // If no values found but we have template context with arguments,
+  // try to compute the value directly from the template argument
+  if (Values.empty() && TemplateCtx && !TemplateCtx->TemplateArgs.empty()) {
+    // Try to evaluate the initializer with the known template argument
+    if (const Expr *Init = VD->getInit()) {
+      // For sizeof expressions or member access to constexpr, we can compute
+      for (const auto &Arg : TemplateCtx->TemplateArgs) {
+        if (auto Val = computeValueFromTemplateArg(Init, Arg, Ctx)) {
+          return *Val + " (for T=" + Arg + ")";
+        }
+      }
+    }
+  }
+
+  if (Values.empty())
+    return std::nullopt;
+
+  // Remove duplicates
+  llvm::sort(Values);
+  Values.erase(llvm::unique(Values), Values.end());
+
+  // If we used the context or all instantiations have the same value, just show
+  // it
+  if (TargetInstantiation || Values.size() == 1)
+    return Values[0];
+
+  // Multiple different values - show them all with a note
+  std::string Result;
+  llvm::raw_string_ostream OS(Result);
+  OS << Values[0];
+  for (size_t I = 1; I < Values.size() && I < 3; ++I)
+    OS << ", " << Values[I];
+  if (Values.size() > 3)
+    OS << ", ...";
+  OS << " (from instantiations)";
+  return Result;
+}
+
 struct PrintExprResult {
   /// The evaluation result on expression `Expr`.
   std::optional<std::string> PrintedValue;
@@ -612,9 +818,10 @@ std::string synthesizeDocumentation(const NamedDecl *ND) {
 }
 
 /// Generate a \p Hover object given the declaration \p D.
-HoverInfo getHoverContents(const NamedDecl *D, const PrintingPolicy &PP,
-                           const SymbolIndex *Index,
-                           const syntax::TokenBuffer &TB) {
+HoverInfo getHoverContents(
+    const NamedDecl *D, const PrintingPolicy &PP, const SymbolIndex *Index,
+    const syntax::TokenBuffer &TB,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx) {
   HoverInfo HI;
   auto &Ctx = D->getASTContext();
 
@@ -669,8 +876,12 @@ HoverInfo getHoverContents(const NamedDecl *D, const PrintingPolicy &PP,
 
   // Fill in value with evaluated initializer if possible.
   if (const auto *Var = dyn_cast<VarDecl>(D); Var && !Var->isInvalidDecl()) {
-    if (const Expr *Init = Var->getInit())
+    if (const Expr *Init = Var->getInit()) {
       HI.Value = printExprValue(Init, Ctx);
+      // If the value is dependent, try to get it from template instantiations
+      if (!HI.Value)
+        HI.Value = printDependentVarValue(Var, Ctx, TemplateCtx);
+    }
   } else if (const auto *ECD = dyn_cast<EnumConstantDecl>(D)) {
     // Dependent enums (e.g. nested in template classes) don't have values yet.
     if (!ECD->getType()->isDependentType())
@@ -1132,9 +1343,78 @@ void maybeAddCalleeArgInfo(const SelectionTree::Node *N, HoverInfo &HI,
   HI.CallPassType.emplace(PassType);
 }
 
-const NamedDecl *pickDeclToUse(llvm::ArrayRef<const NamedDecl *> Candidates) {
+const NamedDecl *pickDeclToUse(
+    llvm::ArrayRef<const NamedDecl *> Candidates,
+    const std::optional<TemplateInstantiationContext> &TemplateCtx = std::nullopt,
+    const ASTContext *Ctx = nullptr, SourceLocation CurLoc = SourceLocation()) {
   if (Candidates.empty())
     return nullptr;
+
+  // If we have a template context and multiple function overloads,
+  // try to find the one that would be called in the instantiated context.
+  if (TemplateCtx && TemplateCtx->InstantiationID && Candidates.size() > 1 && Ctx) {
+    // Find the instantiated function
+    const FunctionDecl *InstFD = nullptr;
+    for (const Decl *D : Ctx->getTranslationUnitDecl()->decls()) {
+      if (const auto *FTD = dyn_cast<FunctionTemplateDecl>(D)) {
+        if (getSymbolID(FTD->getTemplatedDecl()) == TemplateCtx->TemplatePatternID) {
+          for (FunctionDecl *Spec : FTD->specializations()) {
+            if (getSymbolID(Spec) == *TemplateCtx->InstantiationID) {
+              InstFD = Spec;
+              break;
+            }
+          }
+          if (InstFD) break;
+        }
+      }
+    }
+    
+    // If we found the instantiation, look for the actual callee
+    if (InstFD && InstFD->hasBody() && CurLoc.isValid()) {
+      const SourceManager &SM = Ctx->getSourceManager();
+      unsigned TargetOffset = SM.getFileOffset(SM.getSpellingLoc(CurLoc));
+      
+      class CallFinder : public RecursiveASTVisitor<CallFinder> {
+      public:
+        CallFinder(unsigned TargetOff, const SourceManager &SM)
+            : TargetOffset(TargetOff), SM(SM) {}
+        
+        bool VisitCallExpr(CallExpr *CE) {
+          if (Expr *CalleeExpr = CE->getCallee()) {
+            SourceLocation BeginLoc = SM.getSpellingLoc(CalleeExpr->getBeginLoc());
+            if (BeginLoc.isValid()) {
+              unsigned BeginOffset = SM.getFileOffset(BeginLoc);
+              if (TargetOffset >= BeginOffset && TargetOffset <= BeginOffset + 30) {
+                if (const auto *Callee = CE->getDirectCallee()) {
+                  FoundCallee = Callee;
+                  return false;
+                }
+              }
+            }
+          }
+          return true;
+        }
+        
+        const FunctionDecl *getFoundCallee() const { return FoundCallee; }
+        
+      private:
+        unsigned TargetOffset;
+        const SourceManager &SM;
+        const FunctionDecl *FoundCallee = nullptr;
+      };
+      
+      CallFinder Finder(TargetOffset, SM);
+      Finder.TraverseDecl(const_cast<FunctionDecl*>(InstFD));
+      
+      if (const FunctionDecl *Callee = Finder.getFoundCallee()) {
+        SymbolID CalleeID = getSymbolID(Callee);
+        for (const NamedDecl *D : Candidates) {
+          if (getSymbolID(D) == CalleeID)
+            return D;
+        }
+      }
+    }
+  }
 
   // This is e.g the case for
   //     namespace ns { void foo(); }
@@ -1249,9 +1529,10 @@ void maybeAddUsedSymbols(ParsedAST &AST, HoverInfo &HI, const Inclusion &Inc) {
 
 } // namespace
 
-std::optional<HoverInfo> getHover(ParsedAST &AST, Position Pos,
-                                  const format::FormatStyle &Style,
-                                  const SymbolIndex *Index) {
+std::optional<HoverInfo>
+getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
+         const SymbolIndex *Index,
+         const std::optional<TemplateInstantiationContext> &TemplateCtx) {
   static constexpr trace::Metric HoverCountMetric(
       "hover", trace::Metric::Counter, "case");
   PrintingPolicy PP =
@@ -1336,9 +1617,10 @@ std::optional<HoverInfo> getHover(ParsedAST &AST, Position Pos,
       // FIXME: Fill in HighlightRange with range coming from N->ASTNode.
       auto Decls = explicitReferenceTargets(N->ASTNode, DeclRelation::Alias,
                                             AST.getHeuristicResolver());
-      if (const auto *DeclToUse = pickDeclToUse(Decls)) {
+      if (const auto *DeclToUse = pickDeclToUse(Decls, TemplateCtx, 
+                                                     &AST.getASTContext(), *CurLoc)) {
         HoverCountMetric.record(1, "decl");
-        HI = getHoverContents(DeclToUse, PP, Index, TB);
+        HI = getHoverContents(DeclToUse, PP, Index, TB, TemplateCtx);
         // Layout info only shown when hovering on the field/class itself.
         if (DeclToUse == N->ASTNode.get<Decl>())
           addLayoutInfo(*DeclToUse, *HI);

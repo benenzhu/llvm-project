@@ -1,0 +1,11 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "jump.cpp"
+    ],
+    "directory": "/A/clangd-dev/jumptest",
+    "file": "/A/clangd-dev/jumptest/jump.cpp"
+  }
+]
