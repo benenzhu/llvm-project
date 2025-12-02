@@ -552,6 +552,19 @@ public:
   getTemplateContextFromHistory(llvm::StringRef File) const;
   // Clear the template context (but keeps cache)
   void clearTemplateContext();
+  
+  // Get the associated compile unit (.cpp file) for a header file
+  // Returns the OriginFile from template context if available
+  std::optional<std::string> getAssociatedCompileUnit(llvm::StringRef HeaderFile) const;
+  
+  // Register a header -> compile unit mapping
+  void registerHeaderCompileUnit(llvm::StringRef Header, llvm::StringRef CompileUnit);
+
+private:
+  // Header file to compile unit mapping
+  // This allows .h files to use the AST of the .cpp file that includes them
+  mutable std::mutex HeaderMappingMutex;
+  std::map<std::string, std::string> HeaderToCompileUnit;
 };
 
 } // namespace clangd

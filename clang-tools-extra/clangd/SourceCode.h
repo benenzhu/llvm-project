@@ -77,6 +77,13 @@ Position sourceLocToPosition(const SourceManager &SM, SourceLocation Loc);
 llvm::Expected<SourceLocation> sourceLocationInMainFile(const SourceManager &SM,
                                                         Position P);
 
+/// Return the file location in a specific file, corresponding to \p P.
+/// \p FilePath is the path to the file to search in.
+/// This is useful when working with included headers using another file's AST.
+llvm::Expected<SourceLocation> sourceLocationInFile(const SourceManager &SM,
+                                                    llvm::StringRef FilePath,
+                                                    Position P);
+
 /// Returns true iff \p Loc is inside the main file. This function handles
 /// file & macro locations. For macro locations, returns iff the macro is being
 /// expanded inside the main file.

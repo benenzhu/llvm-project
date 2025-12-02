@@ -1860,7 +1860,8 @@ void maybeAddUsedSymbols(ParsedAST &AST, HoverInfo &HI, const Inclusion &Inc) {
 std::optional<HoverInfo>
 getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
          const SymbolIndex *Index,
-         const std::optional<TemplateInstantiationContext> &TemplateCtx) {
+         const std::optional<TemplateInstantiationContext> &TemplateCtx,
+         llvm::StringRef TargetFile) {
   static constexpr trace::Metric HoverCountMetric(
       "hover", trace::Metric::Counter, "case");
 
@@ -1878,7 +1879,12 @@ getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
   PrintingPolicy PP =
       getPrintingPolicy(AST.getASTContext().getPrintingPolicy());
   const SourceManager &SM = AST.getSourceManager();
-  auto CurLoc = sourceLocationInMainFile(SM, Pos);
+  
+  // If TargetFile is specified, look up position in that file
+  // This is used when a header file uses another file's AST
+  llvm::Expected<SourceLocation> CurLoc = 
+      TargetFile.empty() ? sourceLocationInMainFile(SM, Pos)
+                         : sourceLocationInFile(SM, TargetFile, Pos);
   if (!CurLoc) {
     llvm::consumeError(CurLoc.takeError());
     return std::nullopt;

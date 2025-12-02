@@ -809,6 +809,12 @@ void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
     }
   }
   auto CurrentFile = File.str();
+  
+  // For header files, check if we have an associated compile unit
+  // TODO: Using compile unit's AST for headers needs proper position mapping
+  // For now, just use the header's own AST but keep template context
+  // auto AssociatedCU = getAssociatedCompileUnit(File);
+  std::string ASTFile = CurrentFile;  // Always use current file's AST for now
 
   auto Action = [Pos, CB = std::move(CB), CurrentCtx, CurrentFile,
                  this](llvm::Expected<InputsAndAST> InpAST) mutable {
@@ -825,6 +831,15 @@ void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
         Ctx->OriginFile = CurrentFile;
         Ctx->OriginPosition = Pos;
       }
+      
+      // Register header -> compile unit mapping for future operations
+      // This allows .h files to use the .cpp file's AST for template instantiations
+      if (!Ctx->TemplateFile.empty() && !Ctx->OriginFile.empty() &&
+          Ctx->TemplateFile != Ctx->OriginFile) {
+        const_cast<ClangdServer *>(this)->registerHeaderCompileUnit(
+            Ctx->TemplateFile, Ctx->OriginFile);
+      }
+      
       const_cast<ClangdServer *>(this)->setTemplateContext(std::move(Ctx));
     } else if (!Results.empty() && CurrentCtx) {
       // Decide whether to keep the template context:
@@ -871,7 +886,8 @@ void ClangdServer::locateSymbolAt(PathRef File, Position Pos,
     CB(std::move(Results));
   };
 
-  WorkScheduler->runWithAST("Definitions", File, std::move(Action));
+  // Use the associated compile unit's AST if available, otherwise use the current file
+  WorkScheduler->runWithAST("Definitions", ASTFile, std::move(Action));
 }
 
 void ClangdServer::switchSourceHeader(
@@ -918,8 +934,19 @@ void ClangdServer::findHover(PathRef File, Position Pos,
   }
   // Also get a context from history in case the main one doesn't apply
   auto HistoryCtx = getTemplateContextFromHistory(File);
+  
+  // For header files, check if we have an associated compile unit
+  auto AssociatedCU = getAssociatedCompileUnit(File);
+  std::string ASTFile = AssociatedCU ? *AssociatedCU : File.str();
+  if (AssociatedCU) {
+    vlog("findHover: Header {0} using compile unit {1}", File, *AssociatedCU);
+  }
 
-  auto Action = [File = File.str(), Pos, CB = std::move(CB), TemplateCtx,
+  // Determine the target file for position lookup
+  // If using a different AST file (compile unit), we need to look up position in the original file
+  std::string TargetFile = AssociatedCU ? File.str() : "";
+
+  auto Action = [File = File.str(), ASTFile, TargetFile, Pos, CB = std::move(CB), TemplateCtx,
                  HistoryCtx, this](llvm::Expected<InputsAndAST> InpAST) mutable {
     if (!InpAST)
       return CB(InpAST.takeError());
@@ -928,18 +955,20 @@ void ClangdServer::findHover(PathRef File, Position Pos,
         File, InpAST->Inputs.Contents, *InpAST->Inputs.TFS, false);
     
     // First try with the active template context
-    auto Result = clangd::getHover(InpAST->AST, Pos, Style, Index, TemplateCtx);
+    // Pass TargetFile so getHover can look up position in the right file
+    auto Result = clangd::getHover(InpAST->AST, Pos, Style, Index, TemplateCtx,
+                                   TargetFile);
     
     // If no result and we have a history context, try that
     if (!Result && HistoryCtx) {
       Result = clangd::getHover(InpAST->AST, Pos, std::move(Style), Index,
-                                std::move(HistoryCtx));
+                                std::move(HistoryCtx), TargetFile);
     }
     
     CB(std::move(Result));
   };
 
-  WorkScheduler->runWithAST("Hover", File, std::move(Action), Transient);
+  WorkScheduler->runWithAST("Hover", ASTFile, std::move(Action), Transient);
 }
 
 void ClangdServer::typeHierarchy(PathRef File, Position Pos, int Resolve,
@@ -1342,6 +1371,43 @@ void ClangdServer::clearTemplateContext() {
   std::lock_guard<std::mutex> Lock(TemplateContextMutex);
   ActiveTemplateContext = std::nullopt;
   // Note: We don't clear the cache - it persists until a new context is set
+}
+
+std::optional<std::string> 
+ClangdServer::getAssociatedCompileUnit(llvm::StringRef HeaderFile) const {
+  // First check the explicit mapping
+  {
+    std::lock_guard<std::mutex> Lock(HeaderMappingMutex);
+    auto it = HeaderToCompileUnit.find(HeaderFile.str());
+    if (it != HeaderToCompileUnit.end())
+      return it->second;
+  }
+  
+  // Then check template context - OriginFile is the compile unit
+  {
+    std::lock_guard<std::mutex> Lock(TemplateContextMutex);
+    if (ActiveTemplateContext && !ActiveTemplateContext->OriginFile.empty()) {
+      // If the header is the template file, return the origin file as compile unit
+      if (ActiveTemplateContext->TemplateFile == HeaderFile)
+        return ActiveTemplateContext->OriginFile;
+    }
+    
+    // Check cache
+    auto cacheIt = TemplateContextCache.find(HeaderFile.str());
+    if (cacheIt != TemplateContextCache.end() && 
+        !cacheIt->second.OriginFile.empty()) {
+      return cacheIt->second.OriginFile;
+    }
+  }
+  
+  return std::nullopt;
+}
+
+void ClangdServer::registerHeaderCompileUnit(llvm::StringRef Header, 
+                                              llvm::StringRef CompileUnit) {
+  std::lock_guard<std::mutex> Lock(HeaderMappingMutex);
+  HeaderToCompileUnit[Header.str()] = CompileUnit.str();
+  vlog("Registered header mapping: {0} -> {1}", Header, CompileUnit);
 }
 
 } // namespace clangd

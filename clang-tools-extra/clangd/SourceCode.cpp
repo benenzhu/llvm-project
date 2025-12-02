@@ -469,6 +469,47 @@ llvm::Expected<SourceLocation> sourceLocationInMainFile(const SourceManager &SM,
   return SM.getLocForStartOfFile(SM.getMainFileID()).getLocWithOffset(*Offset);
 }
 
+llvm::Expected<SourceLocation> sourceLocationInFile(const SourceManager &SM,
+                                                    llvm::StringRef FilePath,
+                                                    Position P) {
+  if (FilePath.empty())
+    return sourceLocationInMainFile(SM, P);
+  
+  // Try to find the file in the SourceManager by iterating through all files
+  // This works for included headers that are part of the AST
+  for (auto It = SM.fileinfo_begin(), End = SM.fileinfo_end(); It != End; ++It) {
+    FileEntryRef FER = It->first;
+    llvm::StringRef Name = FER.getName();
+    
+    // Match by full path or by filename
+    bool Match = (Name == FilePath);
+    if (!Match) {
+      llvm::StringRef NameFile = llvm::sys::path::filename(Name);
+      llvm::StringRef PathFile = llvm::sys::path::filename(FilePath);
+      Match = (NameFile == PathFile);
+    }
+    
+    if (Match) {
+      FileID FID = SM.translateFile(FER);
+      if (FID.isInvalid())
+        continue;
+      
+      llvm::StringRef Code = SM.getBufferOrFake(FID).getBuffer();
+      if (Code.empty())
+        continue;
+        
+      auto Offset = positionToOffset(Code, P, /*AllowColumnsBeyondLineLength=*/false);
+      if (!Offset)
+        return Offset.takeError();
+      return SM.getLocForStartOfFile(FID).getLocWithOffset(*Offset);
+    }
+  }
+  
+  // Return error if we can't find the file
+  return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                 "File not found in AST: " + FilePath.str());
+}
+
 Range halfOpenToRange(const SourceManager &SM, CharSourceRange R) {
   // Clang is 1-based, LSP uses 0-based indexes.
   Position Begin = sourceLocToPosition(SM, R.getBegin());

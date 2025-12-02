@@ -168,11 +168,15 @@ inline bool operator==(const HoverInfo::Param &LHS,
 /// If TemplateCtx is provided, it contains template instantiation context
 /// from a previous jump operation, which can be used to show concrete values
 /// for template-dependent expressions.
+/// \p TargetFile is optional; if provided, the position is looked up in that
+/// file rather than the main file. This is useful when working with headers
+/// using another file's AST.
 std::optional<HoverInfo>
 getHover(ParsedAST &AST, Position Pos, const format::FormatStyle &Style,
          const SymbolIndex *Index,
          const std::optional<TemplateInstantiationContext> &TemplateCtx =
-             std::nullopt);
+             std::nullopt,
+         llvm::StringRef TargetFile = "");
 
 } // namespace clangd
 } // namespace clang
