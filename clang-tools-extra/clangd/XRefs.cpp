@@ -528,7 +528,7 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
   static constexpr trace::Metric LocateASTReferentMetric(
       "locate_ast_referent", trace::Metric::Counter, "case");
   auto AddResultDecl = [&](const NamedDecl *D,
-                           const FunctionDecl *Instantiation = nullptr) {
+                           const NamedDecl *Instantiation = nullptr) {
     D = getPreferredDecl(D);
     auto Loc =
         makeLocation(AST.getASTContext(), nameLocation(*D, SM), MainFilePath);
@@ -545,27 +545,40 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
 
     // If jumping from a template instantiation, record the context
     if (Instantiation) {
-      if (const auto *TSI = Instantiation->getTemplateSpecializationInfo()) {
-        if (const auto *TAL = TSI->TemplateArguments) {
-          TemplateInstantiationContext Ctx;
-          Ctx.TemplatePatternID = getSymbolID(D);
-          Ctx.TemplateFile = Loc->uri.file();
-          Ctx.TemplateRange = Loc->range;
-          Ctx.InstantiationID = getSymbolID(Instantiation);
-          // Record the origin file (where the template call was made)
-          Ctx.OriginFile = MainFilePath.str();
-
-          // Extract template arguments as strings
-          PrintingPolicy PP(AST.getASTContext().getLangOpts());
-          PP.SuppressTagKeyword = true;
-          for (unsigned I = 0; I < TAL->size(); ++I) {
-            std::string ArgStr;
-            llvm::raw_string_ostream OS(ArgStr);
-            TAL->get(I).print(PP, OS, /*IncludeType=*/false);
-            Ctx.TemplateArgs.push_back(ArgStr);
-          }
-          Result.back().TemplateContext = std::move(Ctx);
+      const TemplateArgumentList *TAL = nullptr;
+      
+      // Handle function template instantiation
+      if (const auto *FD = dyn_cast<FunctionDecl>(Instantiation)) {
+        if (const auto *TSI = FD->getTemplateSpecializationInfo()) {
+          TAL = TSI->TemplateArguments;
         }
+      }
+      // Handle class template instantiation
+      else if (const auto *CTSD = dyn_cast<ClassTemplateSpecializationDecl>(Instantiation)) {
+        TAL = &CTSD->getTemplateArgs();
+      }
+      
+      if (TAL) {
+        TemplateInstantiationContext Ctx;
+        Ctx.TemplatePatternID = getSymbolID(D);
+        Ctx.TemplateFile = Loc->uri.file();
+        Ctx.TemplateRange = Loc->range;
+        Ctx.InstantiationID = getSymbolID(Instantiation);
+        // Record the origin file (where the template call was made)
+        Ctx.OriginFile = MainFilePath.str();
+
+        // Extract template arguments as strings
+        PrintingPolicy PP(AST.getASTContext().getLangOpts());
+        PP.SuppressTagKeyword = true;
+        for (unsigned I = 0; I < TAL->size(); ++I) {
+          std::string ArgStr;
+          llvm::raw_string_ostream OS(ArgStr);
+          TAL->get(I).print(PP, OS, /*IncludeType=*/false);
+          Ctx.TemplateArgs.push_back(ArgStr);
+        }
+        Result.back().TemplateContext = std::move(Ctx);
+        vlog("AddResultDecl: Recorded template context for {0}, args={1}",
+             D->getNameAsString(), Ctx.TemplateArgs.size());
       }
     }
   };
@@ -582,10 +595,57 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
       DeclRelation::TemplateInstantiation | DeclRelation::TemplatePattern;
   auto InstantiationCandidates =
       getDeclAtPositionWithRelations(AST, CurLoc, InstantiationRelations);
+
+  // Try to get class template specialization from TypeLoc if available
+  const ClassTemplateSpecializationDecl *ClassInstantiationFromTypeLoc = nullptr;
+  {
+    unsigned Offset = SM.getDecomposedSpellingLoc(CurLoc).second;
+    SelectionTree::createEach(AST.getASTContext(), AST.getTokens(), Offset,
+                              Offset, [&](SelectionTree ST) {
+      if (const SelectionTree::Node *N = ST.commonAncestor()) {
+        if (const TypeLoc *TL = N->ASTNode.get<TypeLoc>()) {
+          QualType QT = TL->getType();
+          // Unwrap type aliases to get the underlying template specialization
+          while (const auto *TST = QT->getAs<TemplateSpecializationType>()) {
+            if (TST->isTypeAlias()) {
+              QT = TST->getAliasedType();
+            } else {
+              break;
+            }
+          }
+          // Now check if we have a class template specialization
+          if (const auto *TST = QT->getAs<TemplateSpecializationType>()) {
+            if (const CXXRecordDecl *RD = TST->getAsCXXRecordDecl()) {
+              if (const auto *CTSD = dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
+                ClassInstantiationFromTypeLoc = CTSD;
+                vlog("locateASTReferent: Found ClassTemplateSpecializationDecl from TypeLoc: {0}",
+                     CTSD->getNameAsString());
+              }
+            }
+          }
+          // Also check the type directly for RecordType pointing to CTSD
+          if (!ClassInstantiationFromTypeLoc) {
+            if (const auto *RT = QT->getAs<RecordType>()) {
+              if (const auto *CTSD = dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
+                ClassInstantiationFromTypeLoc = CTSD;
+                vlog("locateASTReferent: Found ClassTemplateSpecializationDecl from RecordType: {0}",
+                     CTSD->getNameAsString());
+              }
+            }
+          }
+        }
+      }
+      return ClassInstantiationFromTypeLoc != nullptr;
+    });
+  }
   
   // Debug logging for template instantiation detection
   vlog("locateASTReferent: Candidates.size()={0}, InstantiationCandidates.size()={1}",
        Candidates.size(), InstantiationCandidates.size());
+  if (ClassInstantiationFromTypeLoc) {
+    vlog("locateASTReferent: ClassInstantiationFromTypeLoc={0}",
+         ClassInstantiationFromTypeLoc->getNameAsString());
+  }
   for (const auto &E : Candidates) {
     bool hasTemplatePattern = static_cast<bool>(E.second & DeclRelation::TemplatePattern);
     bool hasTemplateInst = static_cast<bool>(E.second & DeclRelation::TemplateInstantiation);
@@ -720,7 +780,9 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
     LocateASTReferentMetric.record(1, "regular");
     // Otherwise the target declaration is the right one.
     // Check if D is a template pattern and we have an instantiation
-    const FunctionDecl *InstantiationForContext = nullptr;
+    const NamedDecl *InstantiationForContext = nullptr;
+    
+    // Handle function templates
     if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
       vlog("locateASTReferent: D is FunctionDecl: {0}", FD->getNameAsString());
       // If D is the template pattern, look for the original instantiation
@@ -750,6 +812,58 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
         }
       }
     }
+    // Handle class templates
+    else if (const auto *RD = dyn_cast<CXXRecordDecl>(D)) {
+      // Check if this is a class template pattern
+      if (RD->getDescribedClassTemplate() || 
+          (isa<ClassTemplateSpecializationDecl>(RD) && 
+           cast<ClassTemplateSpecializationDecl>(RD)->getSpecializationKind() == TSK_Undeclared)) {
+        // D is a class template pattern, use ClassInstantiationFromTypeLoc if available
+        if (ClassInstantiationFromTypeLoc) {
+          // Verify the instantiation matches this template
+          const CXXRecordDecl *Pattern = ClassInstantiationFromTypeLoc->getTemplateInstantiationPattern();
+          if (Pattern == RD || (Pattern && Pattern->getCanonicalDecl() == RD->getCanonicalDecl())) {
+            InstantiationForContext = ClassInstantiationFromTypeLoc;
+            vlog("locateASTReferent: Using ClassInstantiationFromTypeLoc for {0}",
+                 RD->getNameAsString());
+          }
+        }
+      }
+    }
+    // Handle class template declarations (ClassTemplateDecl)
+    else if (const auto *CTD = dyn_cast<ClassTemplateDecl>(D)) {
+      if (ClassInstantiationFromTypeLoc) {
+        // Verify the instantiation matches this template
+        const ClassTemplateDecl *SpecTemplate = ClassInstantiationFromTypeLoc->getSpecializedTemplate();
+        if (SpecTemplate == CTD || 
+            (SpecTemplate && SpecTemplate->getCanonicalDecl() == CTD->getCanonicalDecl())) {
+          InstantiationForContext = ClassInstantiationFromTypeLoc;
+          vlog("locateASTReferent: Using ClassInstantiationFromTypeLoc for ClassTemplateDecl {0}",
+               CTD->getNameAsString());
+        }
+      }
+    }
+    // Handle type alias templates
+    else if (const auto *TAT = dyn_cast<TypeAliasTemplateDecl>(D)) {
+      // For type alias templates, pass through the underlying class instantiation
+      if (ClassInstantiationFromTypeLoc) {
+        InstantiationForContext = ClassInstantiationFromTypeLoc;
+        vlog("locateASTReferent: Passing through ClassInstantiationFromTypeLoc for TypeAliasTemplate {0}",
+             TAT->getNameAsString());
+      }
+    }
+    // Handle TypeAliasDecl (non-template type alias)
+    else if (const auto *TAD = dyn_cast<TypeAliasDecl>(D)) {
+      if (ClassInstantiationFromTypeLoc) {
+        InstantiationForContext = ClassInstantiationFromTypeLoc;
+        vlog("locateASTReferent: Passing through ClassInstantiationFromTypeLoc for TypeAliasDecl {0}",
+             TAD->getNameAsString());
+      }
+    }
+    else {
+      vlog("locateASTReferent: D is {0}, kind={1}", D->getNameAsString(), D->getDeclKindName());
+    }
+    
     AddResultDecl(D, InstantiationForContext);
   }
   enhanceLocatedSymbolsFromIndex(Result, Index, MainFilePath);
