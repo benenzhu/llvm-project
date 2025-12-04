@@ -570,11 +570,13 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
         // Extract template arguments as strings
         PrintingPolicy PP(AST.getASTContext().getLangOpts());
         PP.SuppressTagKeyword = true;
+        vlog("AddResultDecl: TAL->size()={0}", TAL->size());
         for (unsigned I = 0; I < TAL->size(); ++I) {
           std::string ArgStr;
           llvm::raw_string_ostream OS(ArgStr);
           TAL->get(I).print(PP, OS, /*IncludeType=*/false);
           Ctx.TemplateArgs.push_back(ArgStr);
+          vlog("AddResultDecl: Arg[{0}]={1}", I, ArgStr);
         }
         Result.back().TemplateContext = std::move(Ctx);
         vlog("AddResultDecl: Recorded template context for {0}, args={1}",
@@ -965,7 +967,8 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
         // The callee is an instantiation, but Result contains template patterns.
         // We need to find the template pattern ID to match.
         SymbolID PatternID = CalleeID;
-        if (const FunctionDecl *Pattern = Callee->getTemplateInstantiationPattern())
+        const FunctionDecl *Pattern = Callee->getTemplateInstantiationPattern();
+        if (Pattern)
           PatternID = getSymbolID(Pattern);
         
         std::vector<LocatedSymbol> FilteredResult;
@@ -987,6 +990,32 @@ locateASTReferent(SourceLocation CurLoc, const syntax::Token *TouchedIdentifier,
             Sym.Definition = *CalleeLoc;
             Sym.ID = CalleeID;
             FilteredResult.push_back(std::move(Sym));
+          }
+        }
+        
+        // If Callee is a template instantiation, record its context
+        if (!FilteredResult.empty() && Callee->isFunctionTemplateSpecialization()) {
+          if (const auto *TAL = Callee->getTemplateSpecializationArgs()) {
+            TemplateInstantiationContext Ctx;
+            const NamedDecl *PatternDecl = Pattern ? Pattern : Callee;
+            Ctx.TemplatePatternID = getSymbolID(PatternDecl);
+            Ctx.TemplateFile = FilteredResult[0].PreferredDeclaration.uri.file();
+            Ctx.TemplateRange = FilteredResult[0].PreferredDeclaration.range;
+            Ctx.InstantiationID = CalleeID;
+            Ctx.OriginFile = MainFilePath.str();
+            
+            PrintingPolicy PP(AST.getASTContext().getLangOpts());
+            PP.SuppressTagKeyword = true;
+            vlog("locateASTReferent: Recording callee template context, TAL->size()={0}",
+                 TAL->size());
+            for (unsigned I = 0; I < TAL->size(); ++I) {
+              std::string ArgStr;
+              llvm::raw_string_ostream OS(ArgStr);
+              TAL->get(I).print(PP, OS, /*IncludeType=*/false);
+              Ctx.TemplateArgs.push_back(ArgStr);
+              vlog("locateASTReferent: Callee Arg[{0}]={1}", I, ArgStr);
+            }
+            FilteredResult[0].TemplateContext = std::move(Ctx);
           }
         }
         
@@ -1305,6 +1334,173 @@ locateSymbolAt(ParsedAST &AST, Position Pos, const SymbolIndex *Index,
         auto LocSym = locateSymbolForType(AST, *Deduced, Index);
         if (!LocSym.empty())
           return LocSym;
+      }
+    }
+  }
+
+  // GENERIC: When we have a template context, try to find the target in the
+  // instantiated function's AST. This handles all dependent expressions
+  // (operator[], member calls, etc.) uniformly by looking up in the concrete
+  // instantiation rather than the template pattern.
+  if (ActiveTemplateCtx && ActiveTemplateCtx->InstantiationID) {
+    if (const FunctionDecl *InstFD =
+            findInstantiatedFunctionForJump(AST.getASTContext(), ActiveTemplateCtx)) {
+      if (InstFD->hasBody()) {
+        unsigned TargetOffset = SM.getFileOffset(SM.getSpellingLoc(*CurLoc));
+        vlog("locateSymbolAt: Searching in instantiated function {0} at offset {1}",
+             InstFD->getNameAsString(), TargetOffset);
+        
+        // Generic AST visitor that finds any reference at the target location
+        // We collect all candidates and then pick the best match
+        class InstantiatedRefFinder : public RecursiveASTVisitor<InstantiatedRefFinder> {
+        public:
+          InstantiatedRefFinder(unsigned TargetOff, const SourceManager &SM)
+              : TargetOffset(TargetOff), SM(SM) {}
+          
+          bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+            checkAndAdd(DRE->getLocation(), DRE->getDecl(), /*IsOperator=*/false);
+            return true;
+          }
+          
+          bool VisitMemberExpr(MemberExpr *ME) {
+            checkAndAdd(ME->getMemberLoc(), ME->getMemberDecl(), /*IsOperator=*/false);
+            return true;
+          }
+          
+          bool VisitCXXOperatorCallExpr(CXXOperatorCallExpr *CE) {
+            // For operator calls like [], check if target is on the operator
+            if (auto *Callee = dyn_cast_or_null<FunctionDecl>(CE->getCalleeDecl())) {
+              SourceLocation BeginLoc = SM.getSpellingLoc(CE->getBeginLoc());
+              SourceLocation OpLoc = SM.getSpellingLoc(CE->getOperatorLoc());
+              if (BeginLoc.isValid() && OpLoc.isValid()) {
+                unsigned BeginOff = SM.getFileOffset(BeginLoc);
+                unsigned OpOff = SM.getFileOffset(OpLoc);
+                
+                // For subscript operator[], getOperatorLoc() returns ']' position
+                // The '[' is between the first argument end and getOperatorLoc()
+                // Check if target is between first arg and ']' for subscript
+                bool IsOperatorClick = false;
+                if (CE->getOperator() == OO_Subscript && CE->getNumArgs() >= 1) {
+                  // For src[idx]: first arg is 'src', '[' comes after 'src'
+                  Expr *FirstArg = CE->getArg(0);
+                  if (FirstArg) {
+                    SourceLocation ArgEnd = SM.getSpellingLoc(FirstArg->getEndLoc());
+                    if (ArgEnd.isValid()) {
+                      unsigned ArgEndOff = SM.getFileOffset(ArgEnd);
+                      // '[' is right after the first argument, ']' is at OpOff
+                      // Consider it an operator click if target is near '[' or ']'
+                      IsOperatorClick = (TargetOffset > ArgEndOff && TargetOffset <= OpOff + 1);
+                      vlog("InstantiatedRefFinder: CXXOperatorCallExpr[] argEnd={0}, opOff={1}, target={2}, isOp={3}",
+                           ArgEndOff, OpOff, TargetOffset, IsOperatorClick);
+                    }
+                  }
+                } else {
+                  // For other operators, check distance to operator location
+                  int OpDistance = (OpOff > TargetOffset) ? (OpOff - TargetOffset) 
+                                                          : (TargetOffset - OpOff);
+                  IsOperatorClick = (OpDistance <= 3);
+                }
+                
+                if (IsOperatorClick) {
+                  checkAndAdd(CE->getOperatorLoc(), Callee, /*IsOperator=*/true);
+                }
+              }
+            }
+            return true;
+          }
+          
+          bool VisitCallExpr(CallExpr *CE) {
+            // Skip CXXOperatorCallExpr - handled separately
+            if (isa<CXXOperatorCallExpr>(CE)) return true;
+            if (auto *Callee = CE->getDirectCallee()) {
+              Expr *CalleeExpr = CE->getCallee();
+              if (CalleeExpr) {
+                checkAndAdd(CalleeExpr->getBeginLoc(), Callee, /*IsOperator=*/false);
+              }
+            }
+            return true;
+          }
+          
+          const NamedDecl *getFound() const { return BestDecl; }
+          
+        private:
+          void checkAndAdd(SourceLocation Loc, const NamedDecl *D, bool IsOperator) {
+            if (!D) return;
+            Loc = SM.getSpellingLoc(Loc);
+            if (!Loc.isValid()) return;
+            unsigned Offset = SM.getFileOffset(Loc);
+            // Calculate distance from target
+            int Distance = (Offset > TargetOffset) ? (Offset - TargetOffset) 
+                                                   : (TargetOffset - Offset);
+            // Operators get priority (treat as distance 0 if within range)
+            int EffectiveDistance = IsOperator ? 0 : Distance;
+            
+            // Only consider matches within reasonable range
+            if (Distance <= 15) {
+              if (!BestDecl || EffectiveDistance < BestDistance) {
+                BestDecl = D;
+                BestDistance = EffectiveDistance;
+                vlog("InstantiatedRefFinder: Candidate {0} at offset {1}, distance {2}, isOp={3}",
+                     D->getNameAsString(), Offset, Distance, IsOperator);
+              }
+            }
+          }
+          
+          unsigned TargetOffset;
+          const SourceManager &SM;
+          const NamedDecl *BestDecl = nullptr;
+          int BestDistance = INT_MAX;
+        };
+        
+        // Log instantiation function details
+        SourceLocation BodyStart = InstFD->getBody()->getBeginLoc();
+        SourceLocation BodyEnd = InstFD->getBody()->getEndLoc();
+        unsigned BodyStartOffset = SM.getFileOffset(SM.getSpellingLoc(BodyStart));
+        unsigned BodyEndOffset = SM.getFileOffset(SM.getSpellingLoc(BodyEnd));
+        vlog("locateSymbolAt: InstFD body from offset {0} to {1}, target {2}",
+             BodyStartOffset, BodyEndOffset, TargetOffset);
+        
+        InstantiatedRefFinder Finder(TargetOffset, SM);
+        Finder.TraverseStmt(const_cast<Stmt *>(InstFD->getBody()));
+        
+        if (const NamedDecl *Found = Finder.getFound()) {
+          vlog("locateSymbolAt: Found declaration in instantiation: {0}",
+               Found->getQualifiedNameAsString());
+          LocatedSymbol Result;
+          Result.Name = printName(AST.getASTContext(), *Found);
+          Result.ID = getSymbolID(Found);
+          if (auto Loc = makeLocation(AST.getASTContext(),
+                                      nameLocation(*Found, SM), MainFilePath))
+            Result.PreferredDeclaration = *Loc;
+          if (const NamedDecl *Def = getDefinition(Found))
+            Result.Definition = makeLocation(AST.getASTContext(),
+                                            nameLocation(*Def, SM), MainFilePath);
+          
+          // If the found declaration is a template instantiation, create context for it
+          if (const auto *FD = dyn_cast<FunctionDecl>(Found)) {
+            if (FD->isTemplateInstantiation()) {
+              if (const auto *TAL = FD->getTemplateSpecializationArgs()) {
+                TemplateInstantiationContext Ctx;
+                Ctx.InstantiationID = getSymbolID(FD);
+                if (const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern())
+                  Ctx.TemplatePatternID = getSymbolID(Pattern);
+                PrintingPolicy PP(AST.getLangOpts());
+                for (unsigned I = 0; I < TAL->size(); ++I) {
+                  std::string ArgStr;
+                  llvm::raw_string_ostream OS(ArgStr);
+                  TAL->get(I).print(PP, OS, /*IncludeType=*/false);
+                  Ctx.TemplateArgs.push_back(ArgStr);
+                }
+                if (Result.Definition)
+                  Ctx.TemplateFile = Result.Definition->uri.file();
+                vlog("locateSymbolAt: Creating new context for {0} with {1} template args",
+                     FD->getNameAsString(), TAL->size());
+                Result.TemplateContext = std::move(Ctx);
+              }
+            }
+          }
+          return {std::move(Result)};
+        }
       }
     }
   }
